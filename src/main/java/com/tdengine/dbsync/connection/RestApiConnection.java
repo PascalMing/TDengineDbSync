@@ -38,7 +38,7 @@ public class RestApiConnection implements TdConnection {
             if (url.endsWith("/")) {
                 url = url.substring(0, url.length() - 1);
             }
-            log.info("Establishing REST API connection: {}", url);
+            log.debug("Establishing REST API connection: {}", url);
             connection = DriverManager.getConnection(
                     url,
                     config.getUsername(),
@@ -55,7 +55,7 @@ public class RestApiConnection implements TdConnection {
             try (Statement stmt = conn.createStatement();
                  ResultSet rs = stmt.executeQuery("SELECT SERVER_VERSION()")) {
                 if (rs.next()) {
-                    log.info("TDengine server version (REST): {}", rs.getString(1));
+                    log.debug("TDengine server version (REST): {}", rs.getString(1));
                 }
             }
         } catch (SQLException e) {
@@ -67,10 +67,8 @@ public class RestApiConnection implements TdConnection {
     public List<String> getSuperTableNames(String database) {
         List<String> names = new ArrayList<>();
         try {
-            // Use information_schema to avoid dependency on USE statement
             execute("USE " + database);
-            String sql = "SELECT table_name FROM information_schema.ins_stables WHERE db_name = '" + database + "'";
-            query(sql, rs -> {
+            query("SHOW STABLES", rs -> {
                 while (rs.next()) {
                     String name = rs.getString(1);
                     if (name != null && !name.isBlank()) {
@@ -78,22 +76,10 @@ public class RestApiConnection implements TdConnection {
                     }
                 }
             });
-            if (names.isEmpty()) {
-                // Fallback to SHOW STABLES
-                query("SHOW STABLES", rs -> {
-                    while (rs.next()) {
-                        String name = rs.getString(1);
-                        if (name != null && !name.isBlank()) {
-                            names.add(name);
-                        }
-                    }
-                });
-            }
         } catch (Exception e) {
-            log.warn("Failed to query super table names from information_schema: {}", e.getMessage());
-            // Final fallback
+            // Last resort: try information_schema (column name varies by version)
             try {
-                query("SHOW STABLES", rs -> {
+                query("SELECT table_name FROM information_schema.ins_stables WHERE db_name = '" + database + "'", rs -> {
                     while (rs.next()) {
                         String name = rs.getString(1);
                         if (name != null && !name.isBlank()) {
@@ -102,10 +88,10 @@ public class RestApiConnection implements TdConnection {
                     }
                 });
             } catch (Exception ex) {
-                throw new RuntimeException("Failed to get super table names: " + ex.getMessage(), ex);
+                throw new RuntimeException("Failed to get super table names: " + e.getMessage(), e);
             }
         }
-        log.info("getSuperTableNames({}): found {} super tables: {}", database, names.size(), names);
+        log.info("getSuperTableNames({}): found {} super table(s)", database, names.size());
         return names;
     }
 
@@ -172,7 +158,7 @@ public class RestApiConnection implements TdConnection {
         if (connection != null) {
             try {
                 connection.close();
-                log.info("REST API connection closed");
+                log.debug("REST API connection closed");
             } catch (SQLException e) {
                 log.warn("Failed to close REST API connection: {}", e.getMessage());
             }

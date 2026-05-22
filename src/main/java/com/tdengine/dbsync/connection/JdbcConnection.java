@@ -22,7 +22,7 @@ public class JdbcConnection implements TdConnection {
 
     private Connection getConnection() throws SQLException {
         if (connection == null || connection.isClosed()) {
-            log.info("Establishing JDBC connection: {}", config.getUrl());
+            log.debug("Establishing JDBC connection: {}", config.getUrl());
             connection = DriverManager.getConnection(
                     config.getUrl(),
                     config.getUsername(),
@@ -39,7 +39,7 @@ public class JdbcConnection implements TdConnection {
             try (Statement stmt = conn.createStatement();
                  ResultSet rs = stmt.executeQuery("SELECT SERVER_VERSION()")) {
                 if (rs.next()) {
-                    log.info("TDengine server version: {}", rs.getString(1));
+                    log.debug("TDengine server version: {}", rs.getString(1));
                 }
             }
         } catch (SQLException e) {
@@ -126,7 +126,7 @@ public class JdbcConnection implements TdConnection {
         if (connection != null) {
             try {
                 connection.close();
-                log.info("JDBC connection closed");
+                log.debug("JDBC connection closed");
             } catch (SQLException e) {
                 log.warn("Failed to close JDBC connection: {}", e.getMessage());
             }

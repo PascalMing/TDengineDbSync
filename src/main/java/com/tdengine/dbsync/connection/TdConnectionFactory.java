@@ -1,27 +1,29 @@
 package com.tdengine.dbsync.connection;
 
-import com.tdengine.dbsync.config.SyncProperties;
 import org.springframework.stereotype.Component;
 
 /**
- * Factory for creating TdConnection instances based on configuration.
+ * Factory for creating {@link TdConnection} instances.
+ * <p>
+ * Delegates to {@link TdConnectionPool} for pooled connections when
+ * {@code tdengine.connection-pool-size > 0} (default 50), or creates
+ * direct un-pooled connections when the pool is disabled.
  */
 @Component
 public class TdConnectionFactory {
 
-    private final SyncProperties properties;
+    private final TdConnectionPool pool;
 
-    public TdConnectionFactory(SyncProperties properties) {
-        this.properties = properties;
+    public TdConnectionFactory(TdConnectionPool pool) {
+        this.pool = pool;
     }
 
     /**
-     * Create a new TdConnection based on the configured connection mode.
+     * Obtain a {@link TdConnection}. When pooling is enabled the returned
+     * connection is a {@link PooledTdConnection} whose {@code close()} will
+     * return the underlying connection to the pool rather than destroying it.
      */
     public TdConnection create() {
-        return switch (properties.getConnectionMode()) {
-            case JDBC -> new JdbcConnection(properties.getJdbc());
-            case RESTFUL -> new RestApiConnection(properties.getRestful());
-        };
+        return pool.borrow();
     }
 }

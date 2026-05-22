@@ -54,10 +54,12 @@ public class SyncProperties {
     private DataFormat format = DataFormat.CSV;
     /** Parallel threads for export/import, default 30 */
     private int parallel = 30;
-    /** Batch insert size for import, default 500 */
-    private int batchSize = 500;
+    /** Batch insert size for import, default 5000 */
+    private int batchSize = 5000;
     /** Pipeline queue size for import (number of batches buffered) */
     private int pipelineQueueSize = 10;
+    /** Connection pool size (0 disables pooling, default 50) */
+    private int connectionPoolSize = 50;
 
     public ConnectionMode getConnectionMode() {
         return connectionMode;
@@ -251,6 +253,14 @@ public class SyncProperties {
 
     public void setPipelineQueueSize(int pipelineQueueSize) {
         this.pipelineQueueSize = pipelineQueueSize;
+    }
+
+    public int getConnectionPoolSize() {
+        return connectionPoolSize;
+    }
+
+    public void setConnectionPoolSize(int connectionPoolSize) {
+        this.connectionPoolSize = connectionPoolSize;
     }
 
     public static class JdbcConfig {

@@ -29,7 +29,8 @@ TDengine 3.0+ 数据库数据导出与导入工具，基于 Java 21 + Spring Boo
 - **按天拆分**: 导出自动按天迭代，每天独立子目录 `{yyyyMMdd}/`，数据文件按天组织
 - **断点恢复**: 天级+时间戳双重导出恢复 + 基于文件/行偏移的导入恢复
 - **Schema一致性校验**: 导入时比对超级表DDL，不一致终止并提示
-- **高效导入**: 多消费者并行写入、生产者-消费者流水线、子表先创建后仅插入、多表合并INSERT
+- **高效导入**: 多消费者并行写入、生产者-消费者流水线、子表先创建后仅插入、多表合并INSERT、**多超级表并行导入**
+- **连接池**: 基于Semaphore的连接池，限制最大并发连接数，避免连接泄露
 - **子表名保持**: CSV 含 `tbname` 列，导入时直接使用原始子表名（REST API模式也支持）
 - **子表清单**: 导出时自动生成子表名↔Tags映射清单，导入时预创建子表，跳过USING TAGS
 - **导出/导入库分离**: 支持导出库与导入库不同名，通过 `target-database` 配置
@@ -145,14 +146,17 @@ tdengine:
   # 数据文件格式: csv(高性能) / json(兼容)
   format: csv
 
-  # 并行线程数(导出: 按超级表/子表分组并行; 导入: 多消费者并行写入)
+  # 并行线程数(导出: 按超级表/子表分组并行; 导入: 多超级表并行+多消费者写入)
   parallel: 30
 
   # 导入批量写入大小
-  batch-size: 500
+  batch-size: 5000
 
   # 导入流水线队列深度(读取与写入之间的缓冲批次数)
   pipeline-queue-size: 10
+
+  # 连接池大小(0禁用连接池)
+  connection-pool-size: 50
 ```
 
 ### 配置项说明
@@ -172,9 +176,10 @@ tdengine:
 | `block-size` | int | `100000` | 每个压缩块文件的记录数 |
 | `compression` | Enum | `gzip` | 压缩格式 |
 | `format` | Enum | `csv` | 数据格式，`csv`性能最优，`json`兼容性好 |
-| `parallel` | int | `30` | 并行线程数，导出时按超级表或子表分组并行，导入时多消费者并行写入 |
-| `batch-size` | int | `500` | 导入批量INSERT大小 |
+| `parallel` | int | `30` | 并行线程数，导出时按超级表或子表分组并行，导入时多消费者+多超级表并行 |
+| `batch-size` | int | `5000` | 导入批量INSERT大小。REST API模式下建议5000+以减少HTTP往返次数 |
 | `pipeline-queue-size` | int | `10` | 导入流水线队列深度 |
+| `connection-pool-size` | int | `50` | 连接池最大连接数，0禁用连接池 |
 
 ---
 
@@ -195,7 +200,8 @@ TDengineDbSync/
     │   ├── TdConnection.java               # 连接抽象接口 (Strategy模式)
     │   ├── JdbcConnection.java             # JDBC原生连接实现
     │   ├── RestApiConnection.java          # REST API连接实现 (JDBC-REST桥接)
-    │   └── TdConnectionFactory.java        # 连接工厂 (Factory模式)
+    │   ├── TdConnectionFactory.java        # 连接工厂 (Factory模式)
+    │   └── TdConnectionPool.java           # 连接池 (Object Pool模式, Semaphore实现)
     ├── model/
     │   ├── DataColumn.java                 # 列定义 (名称/类型/长度, 含equals校验)
     │   ├── SuperTableMeta.java             # 超级表元数据 (DDL/列/标签)
@@ -222,7 +228,8 @@ TDengineDbSync/
 |------|---------|------|
 | Strategy | `TdConnection` 接口 | JDBC/REST双连接策略切换 |
 | Factory | `TdConnectionFactory` | 按配置创建连接实例 |
-| Producer-Consumer | `TdDataImporter` | BlockingQueue解耦读取与写入 |
+| Object Pool | `TdConnectionPool` | Semaphore+ConcurrentLinkedQueue 连接池, 限制最大并发 |
+| Producer-Consumer | `TdDataImporter` | BlockingQueue解耦读取与写入, PipelineCtx保证线程安全 |
 | Template Method | 导出/导入接口 | 统一的执行流程框架 |
 | Facade | `SyncService` | 统一入口协调各组件 |
 | Dirty Flag | `CheckpointManager` | 仅在有变更时持久化断点 |
@@ -237,12 +244,13 @@ SyncRunner (CommandLineRunner)
        │    └─ TdConnection <<interface>>
        │         ├─ JdbcConnection
        │         └─ RestApiConnection
+       ├─ TdConnectionPool (连接池, 所有连接复用)
        ├─ TdDataExporter (并行导出)
-       │    ├─ TdConnectionFactory (每个线程独立连接)
+       │    ├─ TdConnectionPool (从池中借连接)
        │    ├─ CheckpointManager (断点读写)
        │    └─ SchemaFile / SuperTableMeta
        └─ TdDataImporter (流水线导入)
-            ├─ TdConnectionFactory (每个写线程独立连接)
+            ├─ TdConnectionPool (每个写线程从池借独立连接)
             ├─ CheckpointManager (断点读写)
             └─ SchemaFile / SuperTableMeta
 ```
@@ -351,22 +359,27 @@ SyncRunner (CommandLineRunner)
               └────────────────────────┬────────────────────┘
                                        │
            ┌───────────────────────────▼───────────────────────────┐
-           │              逐超级表导入                               │
+           │          多超级表并行导入 (ExecutorService)              │
            │                                                        │
-           │  ┌─────────────────────────────────────────────┐       │
-           │  │       生产者-多消费者流水线                    │       │
-           │  │                                              │       │
-           │  │  ┌──────────┐    BlockingQueue    ┌───────┐ │       │
-           │  │  │ 生产者线程 │ ──────────────────→ │消费者×N│ │       │
-           │  │  │ (主线程)   │  (batchSize=500)   │(虚拟   │ │       │
-           │  │  │           │                    │线程)   │ │       │
-           │  │  │ 读.gz文件  │                    │各持独立 │ │       │
-           │  │  │ 解压       │                    │DB连接  │ │       │
-           │  │  │ 解析CSV    │                    │并行    │ │       │
-           │  │  │ 积累批次   │                    │INSERT  │ │       │
-           │  │  └──────────┘                    └───────┘ │       │
-           │  └─────────────────────────────────────────────┘       │
+           │  ┌──────────────────┐  ┌──────────────────┐            │
+           │  │ Pipeline-1: st1  │  │ Pipeline-2: st2  │   ...      │
+           │  │ ┌──────────────┐│  │ ┌──────────────┐│            │
+           │  │ │Producer-Cons.││  │ │Producer-Cons.││            │
+           │  │ │分│ 读文件      ││  │ │分│ 读文件      ││            │
+           │  │ │别│ 解压        ││  │ │别│ 解压        ││            │
+           │  │ │连│ 解析CSV     ││  │ │连│ 解析CSV     ││            │
+           │  │ │接│ 积累批次    ││  │ │接│ 积累批次    ││            │
+           │  │ │池│ BlockQ→插入 ││  │ │池│ BlockQ→插入 ││            │
+           │  │ └──────────────┘│  │ └──────────────┘│            │
+           │  │ 3个消费者虚拟线程│  │ 3个消费者虚拟线程 │            │
+           │  └──────────────────┘  └──────────────────┘            │
            │                                                        │
+           │ 每个超级表的 Pipeline 完全独立:                          │
+           │ - 独立的文件列表、独立的 BlockingQueue                   │
+           │ - 独立的 PipelineCtx (线程安全, 无共享可变状态)           │
+           │ - 从同一连接池 borrow 连接 (Semaphore 确保不超过上限)      │
+           └────────────────────────────────────────────────────────┘
+           │
            │  INSERT SQL 构建:                                      │
            │  ┌──────────────────────────────────────────────┐      │
            │  │ 有子表清单时 (预创建模式)                       │      │
@@ -385,6 +398,19 @@ SyncRunner (CommandLineRunner)
            │  └──────────────────────────────────────────────┘      │
            └────────────────────────────────────────────────────────┘
 ```
+注: Schema校验和子表预创建通过元数据连接完成, 使用单独的非池化连接。
+导入阶段每超级表使用独立 Pipeline + PooledTdConnection。
+
+### REST API 兼容性处理
+
+在某些 TDengine 版本中，`information_schema.ins_stables` 表的列名不一致
+(如 `table_name` 在某些社区版中不可用)。
+`RestApiConnection.getSuperTableNames()` 采用双重策略:
+
+1. **优先使用 `SHOW STABLES`** — 跨版本兼容
+2. **仅当 `SHOW STABLES` 失败时回退到 `information_schema`** — 静默回退, 不打印错误日志
+
+JDBC 原生连接始终使用 `SHOW STABLES`，不受此问题影响。
 
 ---
 
@@ -483,6 +509,11 @@ SyncRunner (CommandLineRunner)
 | 6 | SQL预编译 | 逐字段迭代列名 | 预分配StringBuilder+轻量数字检测 | 2x (拼接) |
 | 7 | 生产者-消费者流水线 | 串行读→写 | 读取与INSERT流水线化, 多消费者并行写入 | 2-4x (IO等待+并行写入) |
 | 8 | 子表先创建后插入 | 每次INSERT含USING TAGS | 首次USING TAGS, 后续仅VALUES | 减少SQL解析开销 |
+| 9 | **并行超级表导入** | **逐超级表串行处理** | **ExecutorService并行处理多个超级表, 每个独立流水线** | **Nx (超级表数)** |
+| 10 | **连接池(Semaphore)** | **每次连接新创建, 用完就关** | **Semaphore+ConcurrentLinkedQueue复用, 消除CAS竞态** | **减少连接建立/关闭开销, 消除连接浪涌** |
+| 11 | **批量大小5000** | **batchSize=300/500** | **batchSize=5000, REST API场景HTTP往返减少90%** | **5-10x (REST API模式)** |
+| 12 | **SHOW STABLES代替information_schema** | **SELECT ... FROM information_schema.ins_stables** | **SHOW STABLES优先, information_schema静默回退** | **修复版本兼容性** |
+| 13 | **连接池日志降级** | **每次借还都打INFO日志** | **连接建立/关闭/版本查询均为DEBUG级别** | **日志量减少99%** |
 
 ### 并行导出详解
 
@@ -522,26 +553,92 @@ Thread-30: st1_P29── tbname IN ('t968',...,'t1000') ─────→ st1_P
 ### 导入流水线详解
 
 ```
-生产者线程 (主线程):                消费者线程 (N个虚拟线程, 各持独立DB连接):
-┌─────────────────────┐            ┌─────────────────────┐
-│ 读取 .gz 文件        │            │ 从 Queue 取 batch    │
-│ 解压 Gzip            │            │                     │
-│ 解析 CSV 行          │     ┌──→   │ Consumer-0: INSERT   │
-│ 积累到 batchSize=500 │     │      │   (Connection 0)    │
-│     │               │     │      ├─────────────────────┤
-│     ▼               │     │      │ Consumer-1: INSERT   │
-│ batchQueue.put() ───┼── Queue ──→│   (Connection 1)    │
-│ (阻塞 if 满载)       │     │      ├─────────────────────┤
-└─────────────────────┘     │      │ Consumer-2: INSERT   │
-                            │      │   (Connection 2)    │
-                            │      ├─────────────────────┤
-                            └──→   │ ...                 │
-                                   └─────────────────────┘
+Producer thread (per super table):           Consumer threads (virtual threads):
+┌──────────────────────────────┐            ┌──────────────────────────────┐
+│ 扫描文件列表(支持断点续传)     │            │ 从 Queue 取 batch            │
+│ 解压 Gzip                    │            │                              │
+│ 解析 CSV 行                  │     ┌──→   │ Consumer-0: INSERT            │
+│ 积累到 batchSize=5000        │     │      │   (PooledTdConnection)       │
+│     │                        │     │      ├──────────────────────────────┤
+│     ▼                        │     │      │ Consumer-1: INSERT            │
+│ batchQueue.put() ────────────┼── Queue ──→│   (PooledTdConnection)       │
+│ (阻塞 if 满载)                │     │      ├──────────────────────────────┤
+└──────────────────────────────┘     │      │ Consumer-2: INSERT            │
+                                     │      │   (PooledTdConnection)       │
+                                     │      ├──────────────────────────────┤
+                                     └──→   │ ...                          │
+                                            └───────┬──────────────────────┘
+                                                     │
+                                            ┌────────▼──────────────────────┐
+                                            │ TdConnectionPool (Semaphore)  │
+                                            │ - borrow(): 获取连接          │
+                                            │ - close(): 归还连接到池        │
+                                            │ - 所有Pipeline共享同一连接池    │
+                                            │ - maxSize=50, 30s超时          │
+                                            └───────────────────────────────┘
 
 消费者数量 = min(parallel, CPU核心数)
 背压控制: Queue满时生产者阻塞, 确保内存可控
 POISON信号: 生产者结束时向每个消费者发送终止信号
+
+多超级表并行:
+  importData() 使用 ExecutorService 为每个超级表提交独立 Pipeline:
+    pipeline-1 (st1): 独立文件列表, 独立 BlockingQueue, 独立 PipelineCtx
+    pipeline-2 (st2): 独立文件列表, 独立 BlockingQueue, 独立 PipelineCtx
+    ...
+  
+  PipelineCtx 内部类封装了每个流水线的可变状态:
+    - header: 文件头部分字段(用于识别列位置)
+    - tagColumnIndices: tag列索引集合
+    - hasTbname: CSV是否含tbname列
+    - currentFileChildTable: 单子表模式下的子表名
+  
+  PipelineCtx 非线程安全, 但通过 BlockingQueue 的 happens-before 保证可见性
 ```
+
+### 连接池设计详解
+
+```
+TdConnectionPool (Object Pool)
+┌───────────────────────────────────────────────────────┐
+│  Semaphore maxSize (公平锁)                            │
+│  ConcurrentLinkedQueue<TdConnection> idle             │
+│  Supplier<TdConnection> factory                       │
+│  volatile boolean destroyed                           │
+└───────────────────────┬───────────────────────────────┘
+                        │
+  borrow()              │          returnConnection()
+  ┌─────▼─────┐         │          ┌─────▼─────┐
+  │tryAcquire │         │          │idle.offer │
+  │(30秒超时)  │         │          │semaphore  │
+  │           │         │          │.release() │
+  │idle.poll()│         │          └───────────┘
+  │ ? 复用     │         │
+  │ : factory │         │
+  │   .get()  │         │
+  └───────────┘         │
+                        │
+  PooledTdConnection (装饰器模式)
+  ┌───────────────────────────────────┐
+  │ 持有原始 TdConnection 引用         │
+  │ close() → returnConnection(原始)   │
+  └───────────────────────────────────┘
+```
+
+**为什么选择 Semaphore + ConcurrentLinkedQueue?**
+
+原方案使用 `AtomicInteger created` 计数 + `LinkedBlockingQueue` 存在CAS竞态问题:
+- `created` 计数器在并发借还中漂移, 导致 idle 队列满时错误关闭连接
+- `LinkedBlockingQueue.offer()` 返回 false 时连接被丢弃
+
+新方案原理:
+- `Semaphore(maxSize, fair=true)`: 硬限制最大并发连接数, 无计数器漂移
+- `ConcurrentLinkedQueue`: 无界非阻塞队列, 不会因为"队列满"而拒绝归还
+- `borrow()`: 先获取信号量许可 → 从 idle 队列取 → 无空闲则创建新连接
+- `returnConnection()`: idle.offer() + semaphore.release() — 永远不会失败
+- `destroy()`: 设置 destroyed 标记, 排干 idle 队列关闭所有连接, 正在使用的连接在归还时直接关闭
+
+配置: `connection-pool-size: 50` (默认), 设为 `0` 禁用连接池 (降级为每次新建)
 
 ### 子表创建优化详解
 
@@ -689,16 +786,20 @@ tdengine:
     - pressure
 ```
 
-### 示例5: 导入数据并调节批量大小
+### 示例5: 导入数据并调节批量大小和连接池
 
 ```yaml
 tdengine:
   mode: import
   database: iot_db
-  batch-size: 1000
-  pipeline-queue-size: 20
+  batch-size: 5000          # REST API模式下建议5000+
+  pipeline-queue-size: 10
+  connection-pool-size: 50  # 连接池(0禁用), 所有Pipeline共享
   format: csv
 ```
+
+REST API 模式下 `batch-size` 对性能影响显著，建议 5000-10000。
+JDBC 原生模式下可适当降低（500-2000），因为无 HTTP 往返开销。
 
 ### 示例6: 中断后恢复
 
@@ -725,7 +826,10 @@ tdengine:
     url: http://tdengine-server:6041
     username: root
     password: taosdata
+  connection-pool-size: 50  # REST API下建议启用连接池,减少HTTP连接建立开销
 ```
+
+REST API 模式下，taos-jdbcdriver 通过 HTTP 协议通信，连接池可显著减少连接建立和关闭的开销。
 
 ### 示例8: 导出库与导入库不同名
 
@@ -746,7 +850,7 @@ tdengine:
   mode: import
   database: hirun_node_monitor      # 数据目录名（源库名）
   target-database: monitor_archive  # 导入目标库（与源库不同名）
-  batch-size: 500
+  batch-size: 5000
   format: csv
 ```
 

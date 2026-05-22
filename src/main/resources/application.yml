@@ -10,30 +10,31 @@ tdengine:
     password: taosdata
   # REST API configuration
   restful:
-    #url: http://127.0.0.1:6041
-    url: http://192.168.3.145:6041
+    url: http://127.0.0.1:6041
+    #url: http://192.168.3.145:6041
     username: root
     password: taosdata
   # Run mode: export / import
-  mode: import
+  mode: export
   # Data directory for export/import files
   data-dir: ./data
   # Target database name
-  database: hirun_node_monitor
+  database: dbtest01
   # Import target database (optional, defaults to same as database above when not set)
-  target-database: hirun_node_monitor2
+  target-database: dbtest02
   # Super tables list (empty means all super tables)
   super-tables: []
   # Export start time (inclusive). Format: "yyyy-MM-dd" or "yyyy-MM-dd HH:mm:ss"
   # Leave blank to auto-detect from database (MIN(ts) across all tables)
-  start-time: "2026-05-01 00:00:00"
+  start-time: "2026-03-31 00:00:00"
   # Export end time (exclusive). Format: "yyyy-MM-dd" or "yyyy-MM-dd HH:mm:ss"
   # Leave blank to auto-detect from database (MAX(ts) across all tables)
-  end-time: "2026-05-22 00:00:00"
+  end-time: "2026-05-02 00:00:00"
   # Common non-time export conditions applied to all super tables
   export-conditions: ""
   # Per-super-table additional non-time conditions (appended with AND to common conditions)
-  stable-conditions: {}
+  stable-conditions:
+    stable_history_data: "device_id = '023109006'"
     # st1: "v1 > 100"
     # st2: "status = 'active'"
   # Records per compressed block file
@@ -42,9 +43,11 @@ tdengine:
   compression: gzip
   # Data file format: csv (fast) / json (compatible)
   format: csv
-  # Parallel threads for export/import (partition + per-day parallelism, multi-writer import)
-  parallel: 3
-  # Batch insert size for import
-  batch-size: 300
+  # Parallel threads for export/import (partition + per-day parallelism, multi-super-table + multi-writer import)
+  parallel: 50
+  # Batch insert size for import (larger = fewer HTTP round-trips)
+  batch-size: 5000
   # Pipeline queue size (number of batches buffered between reader and writer)
-  pipeline-queue-size: 10
+  pipeline-queue-size: 50
+  # Connection pool size (0 disables pooling, default 50)
+  connection-pool-size: 60

@@ -90,8 +90,48 @@ public class TdDataImporter implements DataImporter {
         }
 
         List<String> targetTables = resolveSuperTables(schemaFile);
+
+        if (targetTables.isEmpty()) {
+            log.warn("No super tables to import");
+            return;
+        }
+
+        int parallel = Math.min(properties.getParallel(), targetTables.size());
+        log.info("Importing {} super table(s) with {} concurrent pipeline(s)", targetTables.size(), parallel);
+
+        ExecutorService pipelineExecutor = Executors.newFixedThreadPool(parallel, r -> {
+            Thread t = new Thread(r, "import-pps");
+            t.setDaemon(true);
+            return t;
+        });
+
+        List<Future<Void>> futures = new ArrayList<>();
         for (String stableName : targetTables) {
-            importSuperTableData(targetDb, stableName, schemaFile.getSuperTables().get(stableName), dataDir, checkpoint);
+            final String stable = stableName;
+            futures.add(pipelineExecutor.submit(() -> {
+                importSuperTableData(targetDb, stable, schemaFile.getSuperTables().get(stable), dataDir, checkpoint);
+                return null;
+            }));
+        }
+        pipelineExecutor.shutdown();
+
+        // Collect errors
+        List<Exception> errors = new ArrayList<>();
+        for (Future<Void> f : futures) {
+            try {
+                f.get();
+            } catch (ExecutionException e) {
+                Throwable cause = e.getCause();
+                errors.add(cause instanceof Exception ex ? ex : new RuntimeException(cause));
+            }
+        }
+
+        if (!errors.isEmpty()) {
+            for (Exception err : errors) {
+                log.error("Import error: {}", err.getMessage());
+            }
+            throw new RuntimeException("Import failed: " + errors.size() + " super table(s) had errors. " +
+                    "First error: " + errors.getFirst().getMessage());
         }
 
         checkpointManager.delete();
@@ -296,7 +336,9 @@ public class TdDataImporter implements DataImporter {
         AtomicBoolean error = new AtomicBoolean(false);
         AtomicLong totalRecords = new AtomicLong(sp != null ? sp.getTotalRecords() : 0);
         AtomicLong lastProgressTime = new AtomicLong(System.currentTimeMillis());
-        AtomicLong lastCheckpointTime = new AtomicLong(System.currentTimeMillis());
+
+        // Per-pipeline context (NOT shared across super tables)
+        PipelineCtx ctx = new PipelineCtx();
 
         Set<String> tagColumnNames = new HashSet<>();
         for (DataColumn tag : meta.getTags()) {
@@ -319,19 +361,13 @@ public class TdDataImporter implements DataImporter {
                         if (error.get()) break;
 
                         try {
-                            int inserted = insertBatch(stableName, tagColumnNames, batch, writeConn);
+                            int inserted = insertBatch(stableName, tagColumnNames, batch, writeConn, ctx);
                             totalRecords.addAndGet(inserted);
 
                             long now = System.currentTimeMillis();
                             if (now - lastProgressTime.get() >= PROGRESS_LOG_INTERVAL_MS) {
                                 log.info("  [{}] Imported {} records (writer-{})", stableName, totalRecords.get(), consumerId);
                                 lastProgressTime.set(now);
-                            }
-
-                            if (now - lastCheckpointTime.get() >= CHECKPOINT_SAVE_INTERVAL_MS && sp != null) {
-                                sp.setTotalRecords(totalRecords.get());
-                                checkpointManager.saveIfDirty();
-                                lastCheckpointTime.set(now);
                             }
                         } catch (Exception e) {
                             log.error("  [{}] Batch insert failed (writer-{}): {}", stableName, consumerId, e.getMessage());
@@ -387,15 +423,21 @@ public class TdDataImporter implements DataImporter {
                     // Read header line and parse tag column positions
                     String headerLine = reader.readLine();
                     if (headerLine != null && properties.getFormat() == SyncProperties.DataFormat.CSV) {
-                        // Cache header for batch processing
-                        cachedHeader = parseCsvLine(headerLine);
-                        // Detect if CSV includes tbname (native JDBC mode) or not (REST API mode)
-                        hasTbname = cachedHeader.length > 0 && "tbname".equals(cachedHeader[0]);
-                        tagColumnIndices = new HashSet<>();
-                        for (int i = 0; i < cachedHeader.length; i++) {
-                            if (cachedHeader[i].startsWith("tag_")) {
-                                tagColumnIndices.add(i);
+                        ctx.initFromHeader(headerLine);
+                        // Detect per-child-table format (new export style): no tbname, no tags
+                        if (!ctx.hasTbname && (ctx.tagColumnIndices == null || ctx.tagColumnIndices.isEmpty())) {
+                            String fileName = dataFile.getFileName().toString();
+                            String childTable = extractChildTableName(fileName, stableName);
+                            ctx.currentFileChildTable = childTable;
+                            if (childTable != null) {
+                                log.info("  [{}] Detected per-child-table file format, child table: {}",
+                                        stableName, childTable);
+                            } else {
+                                log.warn("  [{}] Could not extract child table name from filename: {}",
+                                        stableName, fileName);
                             }
+                        } else {
+                            ctx.currentFileChildTable = null;
                         }
                     }
 
@@ -457,12 +499,60 @@ public class TdDataImporter implements DataImporter {
         log.info("  [{}] Import completed: total {} records", stableName, totalRecords.get());
     }
 
-    // Header tracking fields (set per file by producer)
-    private volatile String[] cachedHeader;
-    private volatile Set<Integer> tagColumnIndices;
-    /** Whether the CSV header includes 'tbname' as the first column (native JDBC mode). 
-     *  REST API mode does not return tbname pseudo-column. */
-    private volatile boolean hasTbname = true;
+    // ---- Pipeline context (per-super-table) ----
+
+    /**
+     * Per-pipeline mutable state scoped to one {@link #importSuperTableData} call.
+     * Not thread-safe; only the producer thread writes, consumer threads read after
+     * happens-before edges established by {@link BlockingQueue}.
+     */
+    private static class PipelineCtx {
+        String[] header;
+        Set<Integer> tagColumnIndices;
+        boolean hasTbname;
+        /** Per-child-table mode: all lines belong to this child table. */
+        String currentFileChildTable;
+
+        void initFromHeader(String headerLine) {
+            this.header = parseCsvLine(headerLine);
+            this.hasTbname = header.length > 0 && "tbname".equals(header[0]);
+            this.tagColumnIndices = new HashSet<>();
+            for (int i = 0; i < header.length; i++) {
+                if (header[i].startsWith("tag_")) {
+                    tagColumnIndices.add(i);
+                }
+            }
+        }
+    }
+
+    /**
+     * Extract child table name from a per-child-table export filename.
+     * Format: {stableName}_{childTable}_{timestamp}.gz
+     * Algorithm: remove .gz → strip trailing all-digit segments → remove stableName_ prefix
+     */
+    private String extractChildTableName(String fileName, String stableName) {
+        String name = fileName;
+        if (name.endsWith(".gz")) {
+            name = name.substring(0, name.length() - 3);
+        }
+        // Strip trailing all-digit segments (timestamp + optional collision suffix)
+        while (true) {
+            int lastUnderscore = name.lastIndexOf('_');
+            if (lastUnderscore < 0) break;
+            String lastPart = name.substring(lastUnderscore + 1);
+            if (lastPart.matches("\\d+")) {
+                name = name.substring(0, lastUnderscore);
+            } else {
+                break;
+            }
+        }
+        // Remove stable name prefix
+        String prefix = stableName + "_";
+        if (name.startsWith(prefix)) {
+            name = name.substring(prefix.length());
+        }
+        return name.isEmpty() ? null : name;
+    }
 
     private List<Path> findDataFiles(String stableName, Path dataDir) throws IOException {
         List<Path> files = new ArrayList<>();
@@ -526,7 +616,7 @@ public class TdDataImporter implements DataImporter {
         return relative.toString().replace('\\', '/');
     }
 
-    private String[] parseCsvLine(String line) {
+    private static String[] parseCsvLine(String line) {
         List<String> fields = new ArrayList<>();
         StringBuilder sb = new StringBuilder();
         boolean inQuotes = false;
@@ -563,22 +653,27 @@ public class TdDataImporter implements DataImporter {
      * Insert a batch of records. Now takes a connection parameter for multi-writer support.
      */
     private int insertBatch(String stableName, Set<String> tagColumnNames, List<String> batchLines,
-                             TdConnection conn) {
+                             TdConnection conn, PipelineCtx ctx) {
         if (batchLines.isEmpty()) return 0;
 
         try {
+            // Per-child-table format (new export style): all lines belong to one child table
+            if (ctx.currentFileChildTable != null) {
+                return insertBatchToChildTable(stableName, batchLines, conn, ctx);
+            }
+
             // Group by child table (tbname)
             Map<String, List<String>> grouped = new LinkedHashMap<>();
 
             for (String line : batchLines) {
                 String tbname;
                 if (properties.getFormat() == SyncProperties.DataFormat.CSV) {
-                    if (hasTbname) {
+                    if (ctx.hasTbname) {
                         int tabIdx = line.indexOf(FIELD_SEP);
                         tbname = tabIdx > 0 ? line.substring(0, tabIdx) : line;
                     } else {
                         // No tbname in CSV (REST API mode) - generate from tag values
-                        tbname = generateTbnameFromCsv(line);
+                        tbname = generateTbnameFromCsv(line, ctx);
                     }
                 } else {
                     tbname = extractJsonField(line, "tbname");
@@ -587,7 +682,9 @@ public class TdDataImporter implements DataImporter {
                 grouped.computeIfAbsent(tbname, k -> new ArrayList<>()).add(line);
             }
 
-            StringBuilder sql = new StringBuilder(batchLines.size() * 128);
+            // Pre-allocate: rough estimate of SQL size
+            int estimatedBytes = batchLines.size() * 96;
+            StringBuilder sql = new StringBuilder(estimatedBytes);
             sql.append("INSERT INTO ");
 
             boolean firstTable = true;
@@ -627,7 +724,7 @@ public class TdDataImporter implements DataImporter {
                     sql.append(" USING ").append('`').append(stableName).append('`').append(" TAGS (");
 
                     if (properties.getFormat() == SyncProperties.DataFormat.CSV) {
-                        appendTagValuesFromCsv(sql, tableRecords.getFirst());
+                        appendTagValuesFromCsv(sql, tableRecords.getFirst(), ctx);
                     } else {
                         appendTagValuesFromJson(sql, tableRecords.getFirst(), tagColumnNames);
                     }
@@ -641,7 +738,7 @@ public class TdDataImporter implements DataImporter {
                     if (i > 0) sql.append(' ');
 
                     if (properties.getFormat() == SyncProperties.DataFormat.CSV) {
-                        appendCsvValues(sql, tableRecords.get(i));
+                        appendCsvValues(sql, tableRecords.get(i), ctx);
                     } else {
                         appendJsonValues(sql, tableRecords.get(i), tagColumnNames);
                     }
@@ -665,12 +762,86 @@ public class TdDataImporter implements DataImporter {
     }
 
     /**
+     * Insert a batch of records into a known child table (per-child-table format).
+     * All lines in the batch belong to one child table, values are data columns only.
+     * The child table is already created by the manifest, so no USING TAGS needed.
+     */
+    private int insertBatchToChildTable(String stableName, List<String> batchLines,
+                                         TdConnection conn, PipelineCtx ctx) {
+        String childTable = ctx.currentFileChildTable;
+        int estimated = Math.max(batchLines.size() * 64, 256);
+        StringBuilder sql = new StringBuilder(estimated);
+        sql.append("INSERT INTO `").append(childTable).append("` VALUES ");
+
+        for (int i = 0; i < batchLines.size(); i++) {
+            if (i > 0) sql.append(' ');
+            if (properties.getFormat() == SyncProperties.DataFormat.CSV) {
+                // CSV values are data columns only: all fields are values
+                String[] fields = parseCsvLine(batchLines.get(i));
+                sql.append('(');
+                for (int j = 0; j < fields.length; j++) {
+                    if (j > 0) sql.append(", ");
+                    String val = fields[j];
+                    if (NULL_MARKER.equals(val)) {
+                        sql.append("NULL");
+                    } else {
+                        sql.append(formatSqlValue(val));
+                    }
+                }
+                sql.append(')');
+            } else {
+                // JSON: exclude tbname and tag_ fields
+                appendJsonValuesForChildTable(sql, batchLines.get(i));
+            }
+        }
+
+        try {
+            conn.execute(sql.toString());
+        } catch (Exception e) {
+            log.error("Batch insert FAILED for child table {}:\n  SQL (first 2000 chars): {}\n  Error: {}",
+                    childTable, sql.substring(0, Math.min(sql.length(), 2000)), e.getMessage());
+            throw new RuntimeException("Batch insert failed: " + e.getMessage(), e);
+        }
+        return batchLines.size();
+    }
+
+    /**
+     * Append data values from JSON excluding tbname and tag_ fields.
+     * Used for per-child-table JSON format where only data columns are in the record.
+     */
+    private void appendJsonValuesForChildTable(StringBuilder sql, String line) {
+        sql.append('(');
+        String trimmed = line.trim();
+        if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+            trimmed = trimmed.substring(1, trimmed.length() - 1);
+        }
+        boolean first = true;
+        String[] pairs = trimmed.split(",");
+        for (String pair : pairs) {
+            int colonIdx = pair.indexOf(':');
+            if (colonIdx < 0) continue;
+            String key = pair.substring(0, colonIdx).trim().replace("\"", "").trim();
+            String value = pair.substring(colonIdx + 1).trim().replace("\"", "").trim();
+            if ("tbname".equalsIgnoreCase(key)) continue;
+            if (key.startsWith("tag_")) continue;
+            if (!first) sql.append(", ");
+            if ("null".equalsIgnoreCase(value) || value.isEmpty()) {
+                sql.append("NULL");
+            } else {
+                sql.append(formatSqlValue(value));
+            }
+            first = false;
+        }
+        sql.append(')');
+    }
+
+    /**
      * Append tag values from a CSV line using cached header for tag column detection.
      */
-    private void appendTagValuesFromCsv(StringBuilder sql, String line) {
+    private void appendTagValuesFromCsv(StringBuilder sql, String line, PipelineCtx ctx) {
         String[] fields = parseCsvLine(line);
-        String[] header = this.cachedHeader;
-        Set<Integer> tagIndices = this.tagColumnIndices;
+        String[] header = ctx.header;
+        Set<Integer> tagIndices = ctx.tagColumnIndices;
 
         if (header == null || tagIndices == null || tagIndices.isEmpty()) {
             // Fallback: no header info, can't identify tags
@@ -708,13 +879,13 @@ public class TdDataImporter implements DataImporter {
     /**
      * Append data values from CSV line, excluding tbname (when present) and tag columns.
      */
-    private void appendCsvValues(StringBuilder sql, String line) {
+    private void appendCsvValues(StringBuilder sql, String line, PipelineCtx ctx) {
         String[] fields = parseCsvLine(line);
-        Set<Integer> tagIndices = this.tagColumnIndices;
+        Set<Integer> tagIndices = ctx.tagColumnIndices;
 
         sql.append('(');
         boolean first = true;
-        int startIdx = hasTbname ? 1 : 0;
+        int startIdx = ctx.hasTbname ? 1 : 0;
         for (int i = startIdx; i < fields.length; i++) {
             // Skip tag columns (they go in TAGS clause)
             if (tagIndices != null && tagIndices.contains(i)) continue;
@@ -810,9 +981,9 @@ public class TdDataImporter implements DataImporter {
      * Generate a deterministic child table name from tag values in a CSV line.
      * Used when the CSV does not contain tbname (REST API mode).
      */
-    private String generateTbnameFromCsv(String line) {
+    private String generateTbnameFromCsv(String line, PipelineCtx ctx) {
         String[] fields = parseCsvLine(line);
-        Set<Integer> tagIndices = this.tagColumnIndices;
+        Set<Integer> tagIndices = ctx.tagColumnIndices;
         if (tagIndices != null && !tagIndices.isEmpty()) {
             StringBuilder sb = new StringBuilder();
             for (int idx : tagIndices) {
