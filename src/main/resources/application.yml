@@ -1,0 +1,50 @@
+tdengine:
+  # Connection mode: jdbc / restful
+  connection-mode: restful
+  # JDBC configuration
+  jdbc:
+    driver-class-name: com.taosdata.jdbc.TSDBDriver
+    url: jdbc:TAOS://127.0.0.1:6030
+    #url: jdbc:TAOS://192.168.3.145:6030
+    username: root
+    password: taosdata
+  # REST API configuration
+  restful:
+    #url: http://127.0.0.1:6041
+    url: http://192.168.3.145:6041
+    username: root
+    password: taosdata
+  # Run mode: export / import
+  mode: import
+  # Data directory for export/import files
+  data-dir: ./data
+  # Target database name
+  database: hirun_node_monitor
+  # Import target database (optional, defaults to same as database above when not set)
+  target-database: hirun_node_monitor2
+  # Super tables list (empty means all super tables)
+  super-tables: []
+  # Export start time (inclusive). Format: "yyyy-MM-dd" or "yyyy-MM-dd HH:mm:ss"
+  # Leave blank to auto-detect from database (MIN(ts) across all tables)
+  start-time: "2026-05-01 00:00:00"
+  # Export end time (exclusive). Format: "yyyy-MM-dd" or "yyyy-MM-dd HH:mm:ss"
+  # Leave blank to auto-detect from database (MAX(ts) across all tables)
+  end-time: "2026-05-22 00:00:00"
+  # Common non-time export conditions applied to all super tables
+  export-conditions: ""
+  # Per-super-table additional non-time conditions (appended with AND to common conditions)
+  stable-conditions: {}
+    # st1: "v1 > 100"
+    # st2: "status = 'active'"
+  # Records per compressed block file
+  block-size: 100000
+  # Compression format: gzip
+  compression: gzip
+  # Data file format: csv (fast) / json (compatible)
+  format: csv
+  # Parallel threads for export/import (partition + per-day parallelism, multi-writer import)
+  parallel: 3
+  # Batch insert size for import
+  batch-size: 300
+  # Pipeline queue size (number of batches buffered between reader and writer)
+  pipeline-queue-size: 10
