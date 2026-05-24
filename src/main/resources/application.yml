@@ -32,9 +32,11 @@ tdengine:
   end-time: "2026-05-02 00:00:00"
   # Common non-time export conditions applied to all super tables
   export-conditions: ""
+  # Export SQL order by timestamp ascending (false = faster throughput, true = stable row order)
+  export-order-by-ts: false
   # Per-super-table additional non-time conditions (appended with AND to common conditions)
-  stable-conditions:
-    stable_history_data: "device_id = '023109006'"
+  stable-conditions: {}
+  #  stable_history_data: "device_id = '023109006'"
     # st1: "v1 > 100"
     # st2: "status = 'active'"
   # Records per compressed block file

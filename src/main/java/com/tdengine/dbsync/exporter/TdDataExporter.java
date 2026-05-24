@@ -19,6 +19,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.*;
+import java.nio.file.DirectoryStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -32,7 +33,6 @@ import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 public class TdDataExporter implements DataExporter {
@@ -45,7 +45,7 @@ public class TdDataExporter implements DataExporter {
     private static final long CHECKPOINT_SAVE_INTERVAL_MS = 30_000;
     private static final char FIELD_SEP = '\t';
     private static final String NULL_MARKER = "\\N";
-
+    private static final int MAX_PARTITIONS_PER_STABLE_MULTIPLIER = 4;
     private final SyncProperties properties;
     private final TdConnectionFactory connectionFactory;
     private final CheckpointManager checkpointManager;
@@ -82,6 +82,8 @@ public class TdDataExporter implements DataExporter {
 
             List<String> stableNames = resolveSuperTables(database, metaConn);
             log.info("Found {} super table(s) to export: {}", stableNames.size(), stableNames);
+
+            cleanupLegacyExportFiles(dataDir, stableNames);
 
             SchemaFile schemaFile = exportSchema(database, stableNames, dataDir, metaConn, checkpoint);
 
@@ -170,14 +172,14 @@ public class TdDataExporter implements DataExporter {
                             return t;
                         });
 
-                List<Future<Void>> futures = new ArrayList<>();
-                int submittedCount = 0;
-                int skippedCount = 0;
-                for (Partition partVal : partitions) {
-                    final Partition partition = partVal;
-                    ProgressCheckpoint.StableProgress sp = checkpoint != null
-                            ? checkpoint.getOrCreateStable(partition.stableName) : null;
-                    if (sp != null && sp.isDayCompleted(dayStr)) {
+            List<Future<Void>> futures = new ArrayList<>();
+            int submittedCount = 0;
+            int skippedCount = 0;
+            for (Partition partVal : partitions) {
+                final Partition partition = partVal;
+                ProgressCheckpoint.StableProgress sp = checkpoint != null
+                        ? checkpoint.getOrCreateStable(partition.stableName) : null;
+                if (sp != null && sp.isDayCompleted(dayStr)) {
                         skippedCount++;
                         log.debug("  [{}][{}] Day already completed, skipping partition",
                                 partition.stableName, dayStr);
@@ -190,15 +192,10 @@ public class TdDataExporter implements DataExporter {
                         try (TdConnection dataConn = connectionFactory.create()) {
                             log.debug("  [{}][{}] Partition execution started (connection created)",
                                     partition.stableName, day);
-                            if (partition.childTable != null) {
-                                exportSingleChildTableData(database, partition, day, rangeStart, rangeEnd,
-                                        schemaFile.getSuperTables().get(partition.stableName),
-                                        dataDir, dataConn);
-                            } else {
-                                exportStableDayData(database, partition.stableName, day, rangeStart, rangeEnd,
-                                        schemaFile.getSuperTables().get(partition.stableName),
-                                        dataDir, dataConn);
-                            }
+                            exportDayData(database, partition.stableName, partition.shardCount,
+                                    day, rangeStart, rangeEnd,
+                                    schemaFile.getSuperTables().get(partition.stableName),
+                                    dataDir, dataConn);
                             log.debug("  [{}][{}] Partition execution completed successfully",
                                     partition.stableName, day);
                         } catch (Exception e) {
@@ -253,26 +250,20 @@ public class TdDataExporter implements DataExporter {
 
     static class Partition {
         final String stableName;
-        /** If non-null, this partition exports a single child table directly */
-        final String childTable;
-        /** Partition index for file naming */
-        final int partitionIndex;
+        final int shardCount;
 
-        Partition(String stableName, String childTable, int partitionIndex) {
+        Partition(String stableName, int shardCount) {
             this.stableName = stableName;
-            this.childTable = childTable;
-            this.partitionIndex = partitionIndex;
+            this.shardCount = shardCount;
         }
     }
 
     /**
-     * Build partitions by splitting super tables into parallel groups.
-     * When there are fewer super tables than parallel threads, list matching child tables
-     * and create one partition per child table for direct parallel export.
-     * Each partition queries a single child table directly (no tbname IN clause needed).
+     * Build one partition per super table. Each partition performs a single stable/day
+     * scan and then fans out rows to local shard writers by tbname hash.
      */
     private List<Partition> buildPartitions(String database, List<String> stableNames,
-                                             TdConnection metaConn, int parallelism) throws Exception {
+                                              TdConnection metaConn, int parallelism) throws Exception {
         List<Partition> partitions = new ArrayList<>();
 
         if (stableNames == null || stableNames.isEmpty()) {
@@ -280,29 +271,69 @@ public class TdDataExporter implements DataExporter {
             return partitions;
         }
 
-        if (stableNames.size() >= parallelism) {
-            for (String stableName : stableNames) {
-                partitions.add(new Partition(stableName, null, 0));
-            }
-        } else {
-            for (String stableName : stableNames) {
-                String conditions = properties.getCombinedConditions(stableName);
-                List<String> allChildTables = getChildTableNames(database, stableName, metaConn, conditions);
-                log.info("  Super table {} has {} child table(s) matching conditions", stableName, allChildTables.size());
+        for (String stableName : stableNames) {
+            int childCount = getChildTableNames(database, stableName, metaConn).size();
+            int shardCount = computeShardCount(childCount, parallelism);
+            log.info("  Super table {} has {} child table(s), using {} shard(s)",
+                    stableName, childCount, shardCount);
+            partitions.add(new Partition(stableName, shardCount));
+        }
 
-                if (allChildTables.isEmpty()) {
-                    partitions.add(new Partition(stableName, null, 0));
-                } else {
-                    // Create one partition per child table for direct parallel export
-                    for (int i = 0; i < allChildTables.size(); i++) {
-                        partitions.add(new Partition(stableName, allChildTables.get(i), i));
+        return partitions;
+    }
+
+    private void cleanupLegacyExportFiles(Path dataDir, List<String> stableNames) throws IOException {
+        if (stableNames == null || stableNames.isEmpty()) {
+            return;
+        }
+
+        long deletedCount = 0;
+        for (String stableName : stableNames) {
+            deletedCount += deleteLegacyFilesInDirectory(dataDir, stableName, false);
+
+            try (DirectoryStream<Path> stream = Files.newDirectoryStream(dataDir)) {
+                for (Path entry : stream) {
+                    if (!Files.isDirectory(entry)) {
+                        continue;
                     }
-                    log.info("  Created {} partition(s) for {} (one per child table)", allChildTables.size(), stableName);
+                    String dirName = entry.getFileName().toString();
+                    if (dirName.matches("\\d{8}")) {
+                        deletedCount += deleteLegacyFilesInDirectory(entry, stableName, true);
+                    }
                 }
             }
         }
 
-        return partitions;
+        if (deletedCount > 0) {
+            log.info("Removed {} legacy export file(s) from {}", deletedCount, dataDir);
+        }
+    }
+
+    private long deleteLegacyFilesInDirectory(Path directory, String stableName, boolean dayDirectory) throws IOException {
+        long deletedCount = 0;
+        String filePattern = dayDirectory ? stableName + "_t*.gz" : stableName + "_*.gz";
+
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(directory, filePattern)) {
+            for (Path entry : stream) {
+                String fileName = entry.getFileName().toString();
+                if (fileName.startsWith(stableName + "_P")) {
+                    continue;
+                }
+                Files.deleteIfExists(entry);
+                deletedCount++;
+                log.debug("Deleted legacy export file: {}", entry);
+            }
+        }
+
+        return deletedCount;
+    }
+
+    private int computeShardCount(int childCount, int parallelism) {
+        int base = Math.max(1, parallelism * MAX_PARTITIONS_PER_STABLE_MULTIPLIER);
+        if (childCount <= 0) {
+            return base;
+        }
+        return Math.min(base, childCount);
     }
 
     private List<String> getChildTableNames(String database, String stableName, TdConnection conn) {
@@ -514,15 +545,8 @@ public class TdDataExporter implements DataExporter {
 
     private void exportChildTableManifest(String database, List<String> stableNames, Path dataDir,
                                            TdConnection conn, SchemaFile schemaFile) throws Exception {
-        Path manifestPath = dataDir.resolve(database + "_childtables.json");
-        if (Files.exists(manifestPath)) {
-            log.info("Child table manifest already exists, skipping: {}", manifestPath);
-            return;
-        }
-
-        ChildTableManifest manifest = new ChildTableManifest();
-        manifest.setDatabase(database);
-        manifest.setExportTime(LocalDateTime.now());
+        Path manifestDir = dataDir.resolve("childtables");
+        Files.createDirectories(manifestDir);
 
         for (String stableName : stableNames) {
             SuperTableMeta meta = schemaFile.getSuperTables().get(stableName);
@@ -632,13 +656,21 @@ public class TdDataExporter implements DataExporter {
                 continue;
             }
 
-            manifest.getSuperTables().put(stableName, childTables);
-            log.info("  Exported {} child table(s) for super table {}", childTables.size(), stableName);
+            Path manifestPath = manifestDir.resolve(stableName + ".jsonl.gz");
+            try (OutputStream fos = Files.newOutputStream(manifestPath);
+                 GzipCompressorOutputStream gzipOut = new GzipCompressorOutputStream(new BufferedOutputStream(fos));
+                 BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(gzipOut, StandardCharsets.UTF_8), 131072)) {
+                for (ChildTableMeta child : childTables) {
+                    writer.write(objectMapper.writeValueAsString(child));
+                    writer.newLine();
+                }
+            }
+
+            log.info("  Exported {} child table(s) for super table {} into {}",
+                    childTables.size(), stableName, manifestPath.getFileName());
         }
 
-        objectMapper.writerWithDefaultPrettyPrinter().writeValue(manifestPath.toFile(), manifest);
-        log.info("Child table manifest written to: {} ({} super table(s))",
-                manifestPath, manifest.getSuperTables().size());
+        log.info("Child table manifests written to: {}", manifestDir);
     }
 
     // ---- Day-bounded SQL builders ----
@@ -680,224 +712,16 @@ public class TdDataExporter implements DataExporter {
             sql.append(" WHERE ").append(String.join(" AND ", conditions));
         }
 
-        sql.append(" ORDER BY ").append(quotedTs).append(" ASC");
+        if (properties.isExportOrderByTs()) {
+            sql.append(" ORDER BY ").append(quotedTs).append(" ASC");
+        }
         return sql.toString();
     }
+    // ---- Day export (single stable/day scan + client-side sharding) ----
 
-    // ---- Single child table day export (direct child table query, no tbname IN needed) ----
-
-    /**
-     * Build SQL for a single child table export.
-     * Queries the child table directly with only data columns (no tbname, no tags).
-     */
-    private String buildSingleChildTableExportSql(String database, String childTable, LocalDate day,
-                                                   LocalDateTime rangeStart, LocalDateTime rangeEnd,
-                                                   SuperTableMeta meta,
-                                                   ProgressCheckpoint.StableProgress sp) {
-        String tsColumn = getTimestampColumnName(meta);
-        String quotedTs = quoteId(tsColumn);
-        StringBuilder sql = new StringBuilder();
-        sql.append("SELECT ");
-        boolean first = true;
-        for (DataColumn col : meta.getColumns()) {
-            if (!first) sql.append(", ");
-            sql.append(quoteId(col.getName()));
-            first = false;
-        }
-        sql.append(" FROM ").append(database).append(".").append(childTable);
-
-        List<String> conditions = new ArrayList<>();
-
-        // Day-bounded time condition
-        LocalDateTime dayStart = day.atStartOfDay();
-        LocalDateTime dayEnd = day.plusDays(1).atStartOfDay();
-        LocalDateTime effectiveStart = dayStart.isBefore(rangeStart) ? rangeStart : dayStart;
-        LocalDateTime effectiveEnd = dayEnd.isAfter(rangeEnd) ? rangeEnd : dayEnd;
-
-        if (effectiveStart.isBefore(effectiveEnd)) {
-            conditions.add(quotedTs + " >= '" + effectiveStart.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
-                    + "' AND " + quotedTs + " < '" + effectiveEnd.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")) + "'");
-        }
-
-        // Resume condition
-        if (sp != null && sp.getCurrentDay() != null && sp.getCurrentDay().equals(day.toString())
-                && sp.getLastExportTs() != null && !sp.getLastExportTs().isBlank()) {
-            conditions.add(quotedTs + " > " + sp.getLastExportTs());
-        }
-
-        if (!conditions.isEmpty()) {
-            sql.append(" WHERE ").append(String.join(" AND ", conditions));
-        }
-
-        sql.append(" ORDER BY ").append(quotedTs).append(" ASC");
-        return sql.toString();
-    }
-
-    // ---- Single child table data export ----
-
-    private void exportSingleChildTableData(String database, Partition partition, LocalDate day,
-                                              LocalDateTime rangeStart, LocalDateTime rangeEnd,
-                                              SuperTableMeta meta, Path dataDir,
-                                              TdConnection conn) throws Exception {
-        String stableName = partition.stableName;
-        String childTable = partition.childTable;
-        ProgressCheckpoint checkpoint = checkpointManager.getCheckpoint();
-        ProgressCheckpoint.StableProgress sp = checkpoint != null ? checkpoint.getOrCreateStable(stableName) : null;
-
-        String sql = buildSingleChildTableExportSql(database, childTable, day, rangeStart, rangeEnd, meta, sp);
-        log.info("  [{}][{}][{}] Export query: {}", stableName, childTable, day, sql);
-
-        ResultSet rs = conn.queryDirect(sql);
-        ResultSetMetaData rsMeta = rs.getMetaData();
-        int columnCount = rsMeta.getColumnCount();
-        String[] colLabels = new String[columnCount];
-        for (int i = 0; i < columnCount; i++) {
-            colLabels[i] = rsMeta.getColumnLabel(i + 1);
-        }
-
-        // Build set of data column names (columns from meta, NOT tags)
-        Set<String> dataColumnNames = new HashSet<>();
-        for (DataColumn col : meta.getColumns()) {
-            dataColumnNames.add(col.getName().toLowerCase());
-        }
-
-        String dayDirName = day.format(DATE_DIR_FMT);
-        Path dayDir = dataDir.resolve(dayDirName);
-
-        long totalRecords = 0;
-        int fileIndex = 0;
-        int blockSize = properties.getBlockSize();
-
-        AtomicLong blockRecordCount = new AtomicLong(0);
-        long lastProgressTime = System.currentTimeMillis();
-        long lastCheckpointTime = System.currentTimeMillis();
-
-        OutputStream currentOutputStream = null;
-        BufferedWriter currentWriter = null;
-        String currentFileName = null;
-        String lastTsValue = null;
-
-        while (rs.next()) {
-            if (blockRecordCount.get() == 0 && totalRecords == 0) {
-                Files.createDirectories(dayDir);
-            }
-
-            if (blockRecordCount.get() == 0) {
-                closeWriter(currentWriter, currentOutputStream);
-
-                Object tsObj = rs.getObject(1);
-                String tsStr = formatTimestampForFileName(tsObj);
-                fileIndex++;
-
-                // File name includes child table name: stable_childTable_timestamp.gz
-                currentFileName = stableName + "_" + childTable + "_" + tsStr + ".gz";
-                Path filePath = dayDir.resolve(currentFileName);
-                if (Files.exists(filePath)) {
-                    currentFileName = stableName + "_" + childTable + "_" + tsStr + "_" + fileIndex + ".gz";
-                    filePath = dayDir.resolve(currentFileName);
-                }
-
-                GzipParameters gzipParams = new GzipParameters();
-                gzipParams.setCompressionLevel(6);
-                currentOutputStream = new GzipCompressorOutputStream(
-                        new BufferedOutputStream(Files.newOutputStream(filePath)), gzipParams);
-                currentWriter = new BufferedWriter(
-                        new OutputStreamWriter(currentOutputStream, StandardCharsets.UTF_8), 131072);
-
-                if (properties.getFormat() == SyncProperties.DataFormat.CSV) {
-                    // Header: just data column names (no tbname, no tag_ prefix)
-                    StringBuilder header = new StringBuilder();
-                    for (int i = 0; i < colLabels.length; i++) {
-                        if (i > 0) header.append(FIELD_SEP);
-                        header.append(colLabels[i]);
-                    }
-                    currentWriter.write(header.toString());
-                    currentWriter.newLine();
-                }
-
-                log.info("  [{}][{}][{}] Creating data file: {}/{} (block #{})",
-                        stableName, childTable, day, dayDirName, currentFileName, fileIndex);
-
-                if (sp != null) {
-                    sp.setCurrentFile(dayDirName + "/" + currentFileName);
-                    sp.setCurrentFileOffset(0);
-                    checkpointManager.markDirty();
-                }
-            }
-
-            if (properties.getFormat() == SyncProperties.DataFormat.CSV) {
-                writeSimpleCsvLine(currentWriter, rs, columnCount);
-            } else {
-                writeSimpleJsonLine(currentWriter, rs, columnCount, colLabels);
-            }
-
-            Object tsVal = rs.getObject(1);
-            if (tsVal != null) {
-                lastTsValue = tsVal instanceof Timestamp t
-                        ? String.valueOf(t.getTime())
-                        : tsVal.toString();
-            }
-
-            totalRecords++;
-            blockRecordCount.incrementAndGet();
-
-            long now = System.currentTimeMillis();
-            if (now - lastProgressTime >= PROGRESS_LOG_INTERVAL_MS) {
-                log.info("  [{}][{}][{}] Exported {} records (block #{}: {} records)",
-                        stableName, childTable, day, totalRecords, fileIndex, blockRecordCount.get());
-                lastProgressTime = now;
-            }
-
-            if (now - lastCheckpointTime >= CHECKPOINT_SAVE_INTERVAL_MS && sp != null) {
-                sp.setCurrentFileOffset(blockRecordCount.get());
-                sp.setTotalRecords(sp.getTotalRecords() + totalRecords);
-                sp.setLastExportTs(lastTsValue);
-                checkpointManager.saveIfDirty();
-                lastCheckpointTime = now;
-            }
-
-            if (blockRecordCount.get() >= blockSize) {
-                closeWriter(currentWriter, currentOutputStream);
-                currentWriter = null;
-                currentOutputStream = null;
-
-                if (sp != null && currentFileName != null) {
-                    sp.markFileCompleted(dayDirName + "/" + currentFileName, blockRecordCount.get());
-                    sp.setTotalRecords(sp.getTotalRecords() + totalRecords);
-                    sp.setLastExportTs(lastTsValue);
-                    checkpointManager.markDirty();
-                }
-
-                log.info("  [{}][{}][{}] Block #{} completed: {} records written to {}/{}",
-                        stableName, childTable, day, fileIndex, blockRecordCount.get(), dayDirName, currentFileName);
-                blockRecordCount.set(0);
-            }
-        }
-
-        closeWriter(currentWriter, currentOutputStream);
-
-        if (sp != null && currentFileName != null && blockRecordCount.get() > 0) {
-            sp.markFileCompleted(dayDirName + "/" + currentFileName, blockRecordCount.get());
-            sp.setTotalRecords(sp.getTotalRecords() + totalRecords);
-            sp.setLastExportTs(lastTsValue);
-            checkpointManager.markDirty();
-        }
-
-        if (totalRecords == 0) {
-            log.info("  [{}][{}][{}] No data for this day", stableName, childTable, day);
-        } else {
-            log.info("  [{}][{}][{}] Day export completed: {} records",
-                    stableName, childTable, day, totalRecords);
-        }
-    }
-
-    // ---- Full stable day export (no child-table partitioning) ----
-    // Used when stableNames.size() >= parallelism (no child-table splitting needed).
-
-    private void exportStableDayData(String database, String stableName, LocalDate day,
-                                      LocalDateTime rangeStart, LocalDateTime rangeEnd,
-                                      SuperTableMeta meta, Path dataDir,
-                                      TdConnection conn) throws Exception {
+    private void exportDayData(String database, String stableName, int shardCount,
+                               LocalDate day, LocalDateTime rangeStart, LocalDateTime rangeEnd,
+                               SuperTableMeta meta, Path dataDir, TdConnection conn) throws Exception {
         ProgressCheckpoint checkpoint = checkpointManager.getCheckpoint();
         ProgressCheckpoint.StableProgress sp = checkpoint != null ? checkpoint.getOrCreateStable(stableName) : null;
 
@@ -918,85 +742,38 @@ public class TdDataExporter implements DataExporter {
             tagNames.add(tag.getName().toLowerCase());
         }
 
+        Map<Integer, ShardState> shardStates = new LinkedHashMap<>();
+
         // Create day subdirectory
         String dayDirName = day.format(DATE_DIR_FMT);
         Path dayDir = dataDir.resolve(dayDirName);
 
         long totalRecords = 0;
-        int fileIndex = 0;
         int blockSize = properties.getBlockSize();
 
-        AtomicLong blockRecordCount = new AtomicLong(0);
         long lastProgressTime = System.currentTimeMillis();
         long lastCheckpointTime = System.currentTimeMillis();
-
-        OutputStream currentOutputStream = null;
-        BufferedWriter currentWriter = null;
-        String currentFileName = null;
         String lastTsValue = null;
 
         while (rs.next()) {
             // Create day directory on first record (avoids empty directories)
-            if (blockRecordCount.get() == 0 && totalRecords == 0) {
+            if (totalRecords == 0) {
                 Files.createDirectories(dayDir);
             }
 
-            if (blockRecordCount.get() == 0) {
-                closeWriter(currentWriter, currentOutputStream);
+            Object tbObj = rs.getObject(1);
+            String tbname = tbObj != null ? tbObj.toString() : stableName + "_auto";
+            int shardIndex = shardCount == 1 ? 0 : Math.floorMod(tbname.hashCode(), shardCount);
+            ShardState shardState = shardStates.computeIfAbsent(shardIndex,
+                    idx -> new ShardState(idx, dayDir, stableName, dayDirName, blockSize));
 
-                Object tsObj = rs.getObject(1);
-                String tsStr = formatTimestampForFileName(tsObj);
-                fileIndex++;
+            Object tsObj = rs.getObject(2);
+            shardState.ensureOpen(tsObj, colLabels, tagNames, properties.getFormat());
+            int writtenBytes = properties.getFormat() == SyncProperties.DataFormat.CSV
+                    ? writeCsvLine(shardState.currentWriter, rs, columnCount, colLabels)
+                    : writeJsonLine(shardState.currentWriter, rs, columnCount, colLabels);
 
-                currentFileName = stableName + "_" + tsStr + ".gz";
-                // Check for file name collision and append suffix if needed
-                Path filePath = dayDir.resolve(currentFileName);
-                if (Files.exists(filePath)) {
-                    currentFileName = stableName + "_" + tsStr + "_" + fileIndex + ".gz";
-                    filePath = dayDir.resolve(currentFileName);
-                }
-
-                GzipParameters gzipParams = new GzipParameters();
-                gzipParams.setCompressionLevel(6);
-                currentOutputStream = new GzipCompressorOutputStream(
-                        new BufferedOutputStream(Files.newOutputStream(filePath)), gzipParams);
-                currentWriter = new BufferedWriter(
-                        new OutputStreamWriter(currentOutputStream, StandardCharsets.UTF_8), 131072);
-
-                if (properties.getFormat() == SyncProperties.DataFormat.CSV) {
-                    StringBuilder header = new StringBuilder();
-                    header.append("tbname");
-                    for (int i = 1; i < colLabels.length; i++) {
-                        String label = colLabels[i];
-                        header.append(FIELD_SEP);
-                        if (tagNames.contains(label.toLowerCase())) {
-                            header.append("tag_").append(label);
-                        } else {
-                            header.append(label);
-                        }
-                    }
-                    currentWriter.write(header.toString());
-                    currentWriter.newLine();
-                }
-
-                log.info("  [{}][{}] Creating data file: {}/{} (block #{})",
-                        stableName, day, dayDirName, currentFileName, fileIndex);
-
-                // Checkpoint: store relative path (dayDir/fileName)
-                if (sp != null) {
-                    sp.setCurrentFile(dayDirName + "/" + currentFileName);
-                    sp.setCurrentFileOffset(0);
-                    checkpointManager.markDirty();
-                }
-            }
-
-            if (properties.getFormat() == SyncProperties.DataFormat.CSV) {
-                writeCsvLine(currentWriter, rs, columnCount, colLabels);
-            } else {
-                writeJsonLine(currentWriter, rs, columnCount, colLabels);
-            }
-
-            Object tsVal = rs.getObject(1);
+            Object tsVal = tsObj;
             if (tsVal != null) {
                 lastTsValue = tsVal instanceof Timestamp t
                         ? String.valueOf(t.getTime())
@@ -1004,61 +781,148 @@ public class TdDataExporter implements DataExporter {
             }
 
             totalRecords++;
-            blockRecordCount.incrementAndGet();
+            shardState.blockRecordCount++;
+            shardState.currentFileBytes += writtenBytes;
+            shardState.totalRecords++;
+            shardState.lastTsValue = lastTsValue;
 
             long now = System.currentTimeMillis();
             if (now - lastProgressTime >= PROGRESS_LOG_INTERVAL_MS) {
-                log.info("  [{}][{}] Exported {} records (block #{}: {} records)",
-                        stableName, day, totalRecords, fileIndex, blockRecordCount.get());
+                log.info("  [{}][{}] Exported {} records (shards={}, day={})",
+                        stableName, day, totalRecords, shardStates.size(), dayDirName);
                 lastProgressTime = now;
             }
 
             if (now - lastCheckpointTime >= CHECKPOINT_SAVE_INTERVAL_MS && sp != null) {
-                sp.setCurrentFileOffset(blockRecordCount.get());
                 sp.setTotalRecords(sp.getTotalRecords() + totalRecords);
                 sp.setLastExportTs(lastTsValue);
                 checkpointManager.saveIfDirty();
                 lastCheckpointTime = now;
             }
 
-            if (blockRecordCount.get() >= blockSize) {
-                closeWriter(currentWriter, currentOutputStream);
-                currentWriter = null;
-                currentOutputStream = null;
-
-                if (sp != null && currentFileName != null) {
-                    sp.markFileCompleted(dayDirName + "/" + currentFileName, blockRecordCount.get());
+            if (shardState.blockRecordCount >= blockSize || shardState.currentFileBytes >= shardState.rotateThresholdBytes) {
+                shardState.closeCurrentWriter();
+                if (sp != null && shardState.currentFileName != null) {
+                    sp.markFileCompleted(dayDirName + "/" + shardState.currentFileName, shardState.blockRecordCount);
                     sp.setTotalRecords(sp.getTotalRecords() + totalRecords);
                     sp.setLastExportTs(lastTsValue);
                     checkpointManager.markDirty();
                 }
-
-                log.info("  [{}][{}] Block #{} completed: {} records written to {}/{}",
-                        stableName, day, fileIndex, blockRecordCount.get(), dayDirName, currentFileName);
-                blockRecordCount.set(0);
+                log.info("  [{}][{}][shard-{}] File completed: {} records written to {}/{} ({} bytes)",
+                        stableName, day, shardState.shardIndex, shardState.blockRecordCount, dayDirName,
+                        shardState.currentFileName, shardState.currentFileBytes);
+                shardState.blockRecordCount = 0;
+                shardState.currentFileBytes = 0;
             }
         }
 
-        closeWriter(currentWriter, currentOutputStream);
-
-        if (sp != null && currentFileName != null && blockRecordCount.get() > 0) {
-            sp.markFileCompleted(dayDirName + "/" + currentFileName, blockRecordCount.get());
-            sp.setTotalRecords(sp.getTotalRecords() + totalRecords);
-            sp.setLastExportTs(lastTsValue);
-            checkpointManager.markDirty();
+        for (ShardState shardState : shardStates.values()) {
+            shardState.closeCurrentWriter();
+            if (sp != null && shardState.currentFileName != null && shardState.blockRecordCount > 0) {
+                sp.markFileCompleted(dayDirName + "/" + shardState.currentFileName, shardState.blockRecordCount);
+                sp.setTotalRecords(sp.getTotalRecords() + totalRecords);
+                sp.setLastExportTs(lastTsValue);
+                checkpointManager.markDirty();
+            }
         }
 
         if (totalRecords == 0) {
             log.info("  [{}][{}] No data for this day", stableName, day);
         } else {
-            log.info("  [{}][{}] Day export completed: {} records, {} block file(s)",
-                    stableName, day, totalRecords, fileIndex);
+            log.info("  [{}][{}] Day export completed: {} records, {} shard(s)",
+                    stableName, day, totalRecords, shardStates.size());
+        }
+    }
+
+    private static class ShardState {
+        private final int shardIndex;
+        private final Path dayDir;
+        private final String stableName;
+        private final String dayDirName;
+        private final int blockSize;
+        private final long rotateThresholdBytes = 128L * 1024 * 1024;
+        private OutputStream currentOutputStream;
+        private BufferedWriter currentWriter;
+        private String currentFileName;
+        private long blockRecordCount;
+        private long currentFileBytes;
+        private int fileIndex;
+        private long totalRecords;
+        private String lastTsValue;
+
+        private ShardState(int shardIndex, Path dayDir, String stableName, String dayDirName, int blockSize) {
+            this.shardIndex = shardIndex;
+            this.dayDir = dayDir;
+            this.stableName = stableName;
+            this.dayDirName = dayDirName;
+            this.blockSize = blockSize;
+        }
+
+        private void ensureOpen(Object tsObj, String[] colLabels, Set<String> tagNames,
+                                SyncProperties.DataFormat format) throws IOException {
+            if (currentWriter != null) {
+                return;
+            }
+
+            Files.createDirectories(dayDir);
+            closeCurrentWriter();
+
+            String tsStr = tsObj instanceof Timestamp ts
+                    ? TS_FILE_FMT.format(ts.toInstant())
+                    : tsObj instanceof Long ts ? TS_FILE_FMT.format(Instant.ofEpochMilli(ts))
+                    : tsObj instanceof LocalDateTime ldt ? ldt.format(DateTimeFormatter.ofPattern("HHmmssSSS"))
+                    : String.valueOf(tsObj).replaceAll("[^a-zA-Z0-9_\\-]", "_");
+
+            fileIndex++;
+            currentFileName = stableName + "_P" + shardIndex + "_" + tsStr + ".gz";
+            Path filePath = dayDir.resolve(currentFileName);
+            if (Files.exists(filePath)) {
+                currentFileName = stableName + "_P" + shardIndex + "_" + tsStr + "_" + fileIndex + ".gz";
+                filePath = dayDir.resolve(currentFileName);
+            }
+
+            GzipParameters gzipParams = new GzipParameters();
+            gzipParams.setCompressionLevel(6);
+            currentOutputStream = new GzipCompressorOutputStream(
+                    new BufferedOutputStream(Files.newOutputStream(filePath)), gzipParams);
+            currentWriter = new BufferedWriter(new OutputStreamWriter(currentOutputStream, StandardCharsets.UTF_8), 131072);
+
+            if (format == SyncProperties.DataFormat.CSV) {
+                StringBuilder header = new StringBuilder();
+                header.append("tbname");
+                for (int i = 1; i < colLabels.length; i++) {
+                    String label = colLabels[i];
+                    header.append(FIELD_SEP);
+                    if (tagNames.contains(label.toLowerCase())) {
+                        header.append("tag_").append(label);
+                    } else {
+                        header.append(label);
+                    }
+                }
+                currentWriter.write(header.toString());
+                currentWriter.newLine();
+                currentFileBytes += header.toString().getBytes(StandardCharsets.UTF_8).length + 1L;
+            }
+
+            log.info("  [{}][shard-{}] Creating data file: {}/{}", stableName, shardIndex, dayDirName, currentFileName);
+        }
+
+        private void closeCurrentWriter() throws IOException {
+            if (currentWriter != null) {
+                currentWriter.flush();
+                currentWriter.close();
+                currentWriter = null;
+            }
+            if (currentOutputStream != null) {
+                currentOutputStream.close();
+                currentOutputStream = null;
+            }
         }
     }
 
     // ---- CSV / JSON writers ----
 
-    private void writeCsvLine(BufferedWriter writer, ResultSet rs, int columnCount,
+    private int writeCsvLine(BufferedWriter writer, ResultSet rs, int columnCount,
                                String[] colLabels) throws Exception {
         StringBuilder sb = new StringBuilder(256);
         // First column: tbname (from SELECT tbname, *)
@@ -1092,11 +956,13 @@ public class TdDataExporter implements DataExporter {
                 }
             }
         }
-        writer.write(sb.toString());
+        String line = sb.toString();
+        writer.write(line);
         writer.newLine();
+        return line.getBytes(StandardCharsets.UTF_8).length + 1;
     }
 
-    private void writeJsonLine(BufferedWriter writer, ResultSet rs, int columnCount,
+    private int writeJsonLine(BufferedWriter writer, ResultSet rs, int columnCount,
                                 String[] colLabels) throws Exception {
         Map<String, Object> record = new LinkedHashMap<>();
         // First field: tbname
@@ -1112,8 +978,10 @@ public class TdDataExporter implements DataExporter {
                 record.put(label, value);
             }
         }
-        writer.write(objectMapper.writeValueAsString(record));
+        String line = objectMapper.writeValueAsString(record);
+        writer.write(line);
         writer.newLine();
+        return line.getBytes(StandardCharsets.UTF_8).length + 1;
     }
 
     /**

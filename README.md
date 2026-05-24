@@ -22,7 +22,7 @@ TDengine 3.0+ 数据库数据导出与导入工具，基于 Java 21 + Spring Boo
 ## 功能特性
 
 - **双连接模式**: 支持 JDBC 原生连接和 REST API 连接
-- **并行导出**: 多超级表并行导出 + 单超级表子表分组并行，线程数可配置（默认30）
+- **并行导出**: 多超级表并行导出 + 单超级表固定分片并行，线程数可配置（默认30）
 - **CSV/JSON双格式**: CSV 格式高性能，JSON 格式兼容性好
 - **数据压缩**: Gzip 压缩，按块大小（默认10W条）分文件
 - **组合查询条件**: 结构化时间范围(start-time/end-time) + 通用非时间条件 + 超级表级别附加条件
@@ -32,7 +32,7 @@ TDengine 3.0+ 数据库数据导出与导入工具，基于 Java 21 + Spring Boo
 - **高效导入**: 多消费者并行写入、生产者-消费者流水线、子表先创建后仅插入、多表合并INSERT、**多超级表并行导入**
 - **连接池**: 基于Semaphore的连接池，限制最大并发连接数，避免连接泄露
 - **子表名保持**: CSV 含 `tbname` 列，导入时直接使用原始子表名（REST API模式也支持）
-- **子表清单**: 导出时自动生成子表名↔Tags映射清单，导入时预创建子表，跳过USING TAGS
+- **子表清单**: 导出时自动生成流式子表清单，导入时按目标库现状差集补建并重置 tag
 - **导出/导入库分离**: 支持导出库与导入库不同名，通过 `target-database` 配置
 - **进度日志**: 每10秒输出一次进度，优雅退出时保存断点
 
@@ -132,6 +132,9 @@ tdengine:
   # 通用非时间条件(应用于所有超级表, 如列过滤)
   export-conditions: ""
 
+  # 导出 SQL 是否按时间升序排序。默认 false，以获得更高吞吐
+  export-order-by-ts: false
+
   # 每个超级表的附加非时间条件(用AND与通用条件合并)
   stable-conditions:
     st1: "v1 > 100"
@@ -146,7 +149,7 @@ tdengine:
   # 数据文件格式: csv(高性能) / json(兼容)
   format: csv
 
-  # 并行线程数(导出: 按超级表/子表分组并行; 导入: 多超级表并行+多消费者写入)
+  # 并行线程数(导出: 按超级表/子表固定分片并行; 导入: 多超级表并行+多消费者写入)
   parallel: 30
 
   # 导入批量写入大小
@@ -172,14 +175,17 @@ tdengine:
 | `start-time` | String | `null` | 导出起始时间(含)，留空自动检测 |
 | `end-time` | String | `null` | 导出结束时间(不含)，留空自动检测 |
 | `export-conditions` | String | `""` | 通用非时间WHERE条件，应用于所有超级表 |
+| `export-order-by-ts` | boolean | `false` | 导出 SQL 是否按时间升序排序；默认关闭以提升吞吐 |
 | `stable-conditions` | Map | `{}` | 每个超级表的附加WHERE条件，与通用条件AND合并 |
 | `block-size` | int | `100000` | 每个压缩块文件的记录数 |
 | `compression` | Enum | `gzip` | 压缩格式 |
 | `format` | Enum | `csv` | 数据格式，`csv`性能最优，`json`兼容性好 |
-| `parallel` | int | `30` | 并行线程数，导出时按超级表或子表分组并行，导入时多消费者+多超级表并行 |
+| `parallel` | int | `30` | 并行线程数，导出时按超级表或子表固定分片并行，导入时多消费者+多超级表并行 |
 | `batch-size` | int | `5000` | 导入批量INSERT大小。REST API模式下建议5000+以减少HTTP往返次数 |
 | `pipeline-queue-size` | int | `10` | 导入流水线队列深度 |
 | `connection-pool-size` | int | `50` | 连接池最大连接数，0禁用连接池 |
+
+说明: `export-order-by-ts=false` 是默认值，面向大规模导出时优先保证吞吐；如需严格时间有序输出，再显式开启。
 
 ---
 
@@ -279,7 +285,7 @@ SyncRunner (CommandLineRunner)
               │ 1. 元数据连接 → 查询超级表列表、导出Schema   │
               │    输出: {database}_schema.json              │
               │ 2. 导出子表清单                               │
-              │    输出: {database}_childtables.json         │
+              │    输出: childtables/{stable}.jsonl.gz       │
               └────────────────────────┬────────────────────┘
                                        │
               ┌────────────────────────▼────────────────────┐
@@ -287,7 +293,7 @@ SyncRunner (CommandLineRunner)
               │    - 配置了start-time/end-time → 使用配置值   │
               │    - 未配置 → 自动查询MIN(ts)/MAX(ts)         │
               │ 3. 生成日期列表 [day1, day2, ...]             │
-              │ 4. 构建分区列表 (超级表/子表分组)              │
+              │ 4. 构建分片列表 (超级表/子表批次)              │
               └────────────────────────┬────────────────────┘
                                        │
            ┌───────────────────────────▼───────────────────────────┐
@@ -298,11 +304,11 @@ SyncRunner (CommandLineRunner)
            │    当天所有分区并行执行:                                 │
            │                                                        │
            │    构建 SQL:                                           │
-           │    SELECT tbname, * FROM db.stable                    │
+            │    SELECT tbname, * FROM db.stable                    │
            │    WHERE ts >= '{dayStart}' AND ts < '{dayEnd}'       │
            │      [AND ts > {lastExportTs}]  ← 天内断点恢复        │
            │      [AND {userConditions}]                            │
-           │      [AND tbname IN (...)]     ← 分区模式             │
+            │      [AND tbname IN (...)]     ← 分片模式             │
            │    ORDER BY ts ASC                                     │
            │                     │                                  │
            │          ┌─────────▼──────────┐                        │
@@ -313,7 +319,7 @@ SyncRunner (CommandLineRunner)
            │     │  每10W条 → 创建新 .gz 文件    │                    │
            │     │  目录: {yyyyMMdd}/           │                    │
            │     │  整表: {stable}_{HHmmssSSS}  │                    │
-           │     │  分区: {stable}_P{idx}_...   │                    │
+            │     │  分片: {stable}_P{idx}_...    │                    │
            │     └──────────────┬──────────────┘                    │
            │                    │                                   │
            │     ┌──────────────▼──────────────┐                    │
@@ -350,12 +356,8 @@ SyncRunner (CommandLineRunner)
               │    (目标库, 可与导出库不同名)                  │
               │ 3. 校验 Schema 一致性 (列名/类型/长度)        │
               │    不一致 → 打印差异并终止                     │
-              │ 4. 加载 {database}_childtables.json           │
-              │    (子表清单, 可选, 不存在则回退)              │
-              │ 5. 预创建所有子表                              │
-              │    CREATE TABLE IF NOT EXISTS t1 USING st1    │
-              │      TAGS('v1','v2')                         │
-              │    (子表已有则跳过, 导入时不再USING TAGS)       │
+              │ 4. 查询目标库已存在的 super table / child table │
+              │ 5. 差集补建缺失子表，并重置 tag 不一致的子表    │
               └────────────────────────┬────────────────────┘
                                        │
            ┌───────────────────────────▼───────────────────────────┐
@@ -382,23 +384,17 @@ SyncRunner (CommandLineRunner)
            │
            │  INSERT SQL 构建:                                      │
            │  ┌──────────────────────────────────────────────┐      │
-           │  │ 有子表清单时 (预创建模式)                       │      │
-           │  │ (子表已在导入前用清单预创建, 无USING TAGS):     │      │
-           │  │ INSERT INTO t1 VALUES (ts,col1) (...)         │      │
-           │  │   t2 VALUES (ts,col1) (...)                   │      │
-           │  │                                               │      │
-           │  │ 无子表清单时 (向后兼容)                         │      │
-           │  │ 子表首次出现:                                   │      │
-           │  │ INSERT INTO t1 USING st1 TAGS ('v1','v2')    │      │
-           │  │   VALUES (ts,col1,col2) (ts,col1,col2)       │      │
-           │  │                                               │      │
-           │  │ 子表已存在:                                     │      │
-           │  │ INSERT INTO t1 VALUES (...) t2 VALUES (...)   │      │
-           │  │ (多表合并, 一条SQL写入多个子表)                   │      │
+           │  │ 子表不存在:                                     │      │
+           │  │   CREATE TABLE ... USING ... TAGS(...)         │      │
+           │  │ 子表存在但 tag 不一致:                         │      │
+           │  │   ALTER TABLE ... SET TAG                      │      │
+           │  │ 子表已存在且 tag 一致:                         │      │
+           │  │   INSERT INTO t1 VALUES (...) t2 VALUES (...)  │      │
+           │  │   (多表合并, 一条SQL写入多个子表)               │      │
            │  └──────────────────────────────────────────────┘      │
            └────────────────────────────────────────────────────────┘
 ```
-注: Schema校验和子表预创建通过元数据连接完成, 使用单独的非池化连接。
+注: Schema校验和子表现状查询/差集补建通过元数据连接完成, 使用单独的非池化连接。
 导入阶段每超级表使用独立 Pipeline + PooledTdConnection。
 
 ### REST API 兼容性处理
@@ -501,14 +497,14 @@ JDBC 原生连接始终使用 `SHOW STABLES`，不受此问题影响。
 
 | # | 优化项 | 原方案 | 优化后 | 预估提升 |
 |---|--------|--------|--------|---------|
-| 1 | 并行导出 | 串行遍历超级表 | 30线程并行, 每线程独立连接, 单表按子表分组 | 30x (超级表数或子表分组数) |
+| 1 | 并行导出 | 串行遍历超级表 | 30线程并行, 每线程独立连接, 单表按固定分片 | 30x (超级表数或分片数) |
 | 2 | CSV格式替代JSON | 每行Jackson序列化 | StringBuilder直接拼接Tab分隔 | 5-10x (序列化) |
 | 3 | 时间戳断点恢复 | 重新查询+逐行跳过 | WHERE ts > lastExportTs | O(n)→O(1) |
 | 4 | 去除INDENT_OUTPUT | JSON美化缩进 | 数据文件无缩进 | 减少文件体积50%+ |
 | 5 | CSV导入解析 | Jackson逐行反序列化 | 单遍字符串切分 | 5-10x (解析) |
 | 6 | SQL预编译 | 逐字段迭代列名 | 预分配StringBuilder+轻量数字检测 | 2x (拼接) |
 | 7 | 生产者-消费者流水线 | 串行读→写 | 读取与INSERT流水线化, 多消费者并行写入 | 2-4x (IO等待+并行写入) |
-| 8 | 子表先创建后插入 | 每次INSERT含USING TAGS | 首次USING TAGS, 后续仅VALUES | 减少SQL解析开销 |
+| 8 | 子表差集补建 | 预创建全部子表 | 先查询现状，只补缺失与重置 tag | 大幅减少 DDL |
 | 9 | **并行超级表导入** | **逐超级表串行处理** | **ExecutorService并行处理多个超级表, 每个独立流水线** | **Nx (超级表数)** |
 | 10 | **连接池(Semaphore)** | **每次连接新创建, 用完就关** | **Semaphore+ConcurrentLinkedQueue复用, 消除CAS竞态** | **减少连接建立/关闭开销, 消除连接浪涌** |
 | 11 | **批量大小5000** | **batchSize=300/500** | **batchSize=5000, REST API场景HTTP往返减少90%** | **5-10x (REST API模式)** |
@@ -531,23 +527,26 @@ Thread-30: st30 ──── JDBC Connection 30 ───→ st30_*.gz
 每个线程独立连接, 互不阻塞
 ```
 
-**场景2: 单超级表 + 大量子表 → 子表分组并行**
+**场景2: 单超级表 + 大量子表 → 固定分片并行**
 
-当超级表数量少于 parallel 线程数时，自动按子表分组拆分为多个并行任务：
+当单超级表子表数很大时，按固定数量的 shard writer 并发写盘：
+
+shard 数通常设置为 `parallel * 4` 上限，再由线程池调度执行。这样可以让查询结果只扫描一次，然后在客户端按 `tbname hash` 分流到多个 shard 文件，同时保留连接池和 CPU 的可控并发。
 
 ```
-1个超级表 st1, 1000个子表, parallel=30:
+1个超级表 st1, 100000个子表, parallel=30:
 
-1. 查询所有子表名: SELECT TBNAME FROM db.st1 GROUP BY TBNAME
-2. 按子表数量均分为30组, 每组约33个子表
-3. 每组独立线程并行导出:
+1. 只查询一次: SELECT tbname, * FROM db.st1 ... ORDER BY ts ASC
+2. 客户端按 tbname hash 分成 120 个 shard writer
+3. 每个 shard 独立写自己的 .gz 文件, 按 128MB 左右轮转
 
-Thread-1:  st1_P0 ─── tbname IN ('t1','t2',...,'t33') ───→ st1_P0_*.gz
-Thread-2:  st1_P1 ─── tbname IN ('t34','t35',...,'t66') ──→ st1_P1_*.gz
-  ...
-Thread-30: st1_P29── tbname IN ('t968',...,'t1000') ─────→ st1_P29_*.gz
+Reader thread:  单次 ResultSet 扫描
+    ├── hash(t1) → shard 0 → st1_P0_*.gz
+    ├── hash(t2) → shard 17 → st1_P17_*.gz
+    └── hash(t3) → shard 83 → st1_P83_*.gz
 
-分区文件名: {stable}_P{partitionIndex}_{timestamp}.gz
+分片文件名: {stable}_P{partitionIndex}_{timestamp}.gz
+文件在达到约 `128MB` 后自动轮转生成下一个 shard 块。
 ```
 
 ### 导入流水线详解
@@ -665,7 +664,9 @@ INSERT INTO t1 VALUES (...) (...) t2 VALUES (...) t3 VALUES (...);
 ./data/
 └── {database}/
     ├── {database}_schema.json          # Schema定义文件
-    ├── {database}_childtables.json     # 子表名↔Tags映射清单（新增）
+    ├── childtables/
+    │   ├── st1.jsonl.gz                # 流式子表清单（按超级表）
+    │   └── st2.jsonl.gz
     ├── {database}_progress.json        # 断点文件(运行中存在, 完成后删除)
     ├── 20240115/                        # 日期子目录 (yyyyMMdd)
     │   ├── st1_000000.gz               # st1当天第一个数据块(时间精确到毫秒)

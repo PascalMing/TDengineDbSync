@@ -5,7 +5,6 @@ import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.tdengine.dbsync.config.SyncProperties;
 import com.tdengine.dbsync.connection.TdConnection;
 import com.tdengine.dbsync.connection.TdConnectionFactory;
-import com.tdengine.dbsync.model.ChildTableManifest;
 import com.tdengine.dbsync.model.ChildTableMeta;
 import com.tdengine.dbsync.model.DataColumn;
 import com.tdengine.dbsync.model.ProgressCheckpoint;
@@ -33,13 +32,13 @@ public class TdDataImporter implements DataImporter {
     private static final long CHECKPOINT_SAVE_INTERVAL_MS = 30_000;
     private static final char FIELD_SEP = '\t';
     private static final String NULL_MARKER = "\\N";
+    private static final int CHILD_TABLE_BATCH_SIZE = 200;
 
     private final SyncProperties properties;
     private final TdConnectionFactory connectionFactory;
     private final CheckpointManager checkpointManager;
     private final ObjectMapper objectMapper;
     private final Set<String> createdChildTables = ConcurrentHashMap.newKeySet();
-    private boolean hasChildTableManifest = false;
 
     public TdDataImporter(SyncProperties properties, TdConnectionFactory connectionFactory,
                           CheckpointManager checkpointManager) {
@@ -86,7 +85,7 @@ public class TdDataImporter implements DataImporter {
             metaConn.execute("USE " + targetDb);
 
             validateAndCreateSchema(targetDb, schemaFile, metaConn);
-            loadAndCreateChildTables(sourceDb, targetDb, schemaFile, metaConn);
+            loadAndReconcileChildTables(sourceDb, targetDb, schemaFile, metaConn);
         }
 
         List<String> targetTables = resolveSuperTables(schemaFile);
@@ -174,59 +173,255 @@ public class TdDataImporter implements DataImporter {
         log.info("Pre-loaded {} existing child tables total", totalExisting);
     }
 
-    private void loadAndCreateChildTables(String sourceDb, String targetDb, SchemaFile schemaFile, TdConnection conn) {
-        Path manifestPath = Path.of(properties.getDataDir(), sourceDb, sourceDb + "_childtables.json");
+    private void loadAndReconcileChildTables(String sourceDb, String targetDb, SchemaFile schemaFile, TdConnection conn) {
+        Path manifestDir = Path.of(properties.getDataDir(), sourceDb, "childtables");
 
-        if (!Files.exists(manifestPath)) {
-            log.info("No child table manifest found ({}), falling back to tag-based generation", manifestPath);
-            preloadExistingChildTables(targetDb, schemaFile, conn);
-            return;
-        }
+        for (Map.Entry<String, SuperTableMeta> entry : schemaFile.getSuperTables().entrySet()) {
+            String stableName = entry.getKey();
+            SuperTableMeta meta = entry.getValue();
 
-        try {
-            ChildTableManifest manifest = objectMapper.readValue(manifestPath.toFile(), ChildTableManifest.class);
-            int totalCreated = 0;
-
-            for (Map.Entry<String, List<ChildTableMeta>> entry : manifest.getSuperTables().entrySet()) {
-                String stableName = entry.getKey();
-                List<ChildTableMeta> children = entry.getValue();
-                int createdCount = 0;
-
-                for (ChildTableMeta child : children) {
-                    String tbname = child.getTbname();
-                    if (tbname == null || tbname.isBlank()) continue;
-
-                    LinkedHashMap<String, String> tagVals = child.getTagValues();
-
-                    // Build: CREATE TABLE IF NOT EXISTS `tbname` USING `stableName` TAGS(v1, v2, ...)
-                    StringBuilder ddl = new StringBuilder();
-                    ddl.append("CREATE TABLE IF NOT EXISTS `").append(tbname)
-                       .append("` USING `").append(stableName).append("` TAGS (");
-
-                    boolean first = true;
-                    for (String tagVal : tagVals.values()) {
-                        if (!first) ddl.append(", ");
-                        ddl.append(formatSqlValue(tagVal));
-                        first = false;
-                    }
-                    ddl.append(")");
-
-                    conn.execute(ddl.toString());
-                    createdChildTables.add(stableName + ":" + tbname);
-                    createdCount++;
-                }
-
-                totalCreated += createdCount;
-                log.info("  Created/verified {} child table(s) for super table {}", createdCount, stableName);
+            if (meta.getTags() == null || meta.getTags().isEmpty()) {
+                log.debug("  Skipping child table reconcile for {} (no tags)", stableName);
+                continue;
             }
 
-            hasChildTableManifest = true;
-            log.info("Child table manifest loaded: {} child table(s) across {} super table(s) created/verified",
-                    totalCreated, manifest.getSuperTables().size());
+            Path manifestPath = manifestDir.resolve(stableName + ".jsonl.gz");
+            if (!Files.exists(manifestPath)) {
+                throw new RuntimeException("Child table manifest not found: " + manifestPath);
+            }
+
+            Set<String> existingChildTables = queryExistingChildTables(targetDb, stableName, conn);
+            createdChildTables.addAll(existingChildTables);
+            log.info("  [{}] Existing child tables in target: {}", stableName, existingChildTables.size());
+
+            reconcileChildTablesForStable(targetDb, stableName, meta, manifestPath, existingChildTables, conn);
+        }
+    }
+
+    private Set<String> queryExistingChildTables(String database, String stableName, TdConnection conn) {
+        Set<String> names = new LinkedHashSet<>();
+        try {
+            conn.query("SELECT table_name FROM information_schema.ins_child_tables " +
+                    "WHERE db_name = '" + database + "' AND stable_name = '" + stableName + "'", rs -> {
+                while (rs.next()) {
+                    String tbname = rs.getString(1);
+                    if (tbname != null && !tbname.isBlank()) {
+                        names.add(tbname);
+                    }
+                }
+            });
         } catch (Exception e) {
-            log.warn("Failed to load child table manifest '{}', falling back: {}",
-                    manifestPath, e.getMessage());
-            preloadExistingChildTables(targetDb, schemaFile, conn);
+            log.warn("  information_schema query failed for existing child tables of {}: {}", stableName, e.getMessage());
+        }
+
+        if (names.isEmpty()) {
+            try {
+                conn.query("SELECT TBNAME FROM " + database + "." + stableName + " GROUP BY TBNAME", rs -> {
+                    while (rs.next()) {
+                        String tbname = rs.getString(1);
+                        if (tbname != null && !tbname.isBlank()) {
+                            names.add(tbname);
+                        }
+                    }
+                });
+            } catch (Exception e) {
+                log.debug("  No existing child tables found for {}: {}", stableName, e.getMessage());
+            }
+        }
+
+        return names;
+    }
+
+    private void reconcileChildTablesForStable(String database, String stableName, SuperTableMeta meta,
+                                               Path manifestPath, Set<String> existingChildTables,
+                                               TdConnection conn) {
+        int createdCount = 0;
+        int resetCount = 0;
+        int scannedCount = 0;
+
+        List<ChildTableMeta> batch = new ArrayList<>(CHILD_TABLE_BATCH_SIZE);
+        try (InputStream fis = Files.newInputStream(manifestPath);
+             GzipCompressorInputStream gzipIn = new GzipCompressorInputStream(fis);
+             BufferedReader reader = new BufferedReader(new InputStreamReader(gzipIn, StandardCharsets.UTF_8), 131072)) {
+
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (line.isBlank()) continue;
+                ChildTableMeta child = objectMapper.readValue(line, ChildTableMeta.class);
+                if (child.getTbname() == null || child.getTbname().isBlank()) continue;
+                batch.add(child);
+                scannedCount++;
+
+                if (batch.size() >= CHILD_TABLE_BATCH_SIZE) {
+                    int[] counts = reconcileChildTableBatch(database, stableName, meta, batch, existingChildTables, conn);
+                    createdCount += counts[0];
+                    resetCount += counts[1];
+                    batch.clear();
+                }
+            }
+
+            if (!batch.isEmpty()) {
+                int[] counts = reconcileChildTableBatch(database, stableName, meta, batch, existingChildTables, conn);
+                createdCount += counts[0];
+                resetCount += counts[1];
+            }
+
+            log.info("  [{}] Reconciled {} child table(s): created {}, reset {}",
+                    stableName, scannedCount, createdCount, resetCount);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to reconcile child tables for " + stableName + ": " + e.getMessage(), e);
+        }
+    }
+
+    private int[] reconcileChildTableBatch(String database, String stableName, SuperTableMeta meta,
+                                           List<ChildTableMeta> batch, Set<String> existingChildTables,
+                                           TdConnection conn) throws Exception {
+        List<ChildTableMeta> missing = new ArrayList<>();
+        List<ChildTableMeta> existing = new ArrayList<>();
+
+        for (ChildTableMeta child : batch) {
+            if (existingChildTables.contains(child.getTbname())) {
+                existing.add(child);
+            } else {
+                missing.add(child);
+            }
+        }
+
+        int created = 0;
+        int reset = 0;
+
+        if (!missing.isEmpty()) {
+            conn.execute(buildBatchCreateChildTableSql(stableName, missing, meta));
+            for (ChildTableMeta child : missing) {
+                String key = stableName + ":" + child.getTbname();
+                createdChildTables.add(key);
+                existingChildTables.add(child.getTbname());
+            }
+            created = missing.size();
+        }
+
+        if (!existing.isEmpty()) {
+            Map<String, LinkedHashMap<String, String>> currentTags = queryChildTableTags(database, stableName, meta, existing, conn);
+            List<ChildTableMeta> needReset = new ArrayList<>();
+            for (ChildTableMeta child : existing) {
+                LinkedHashMap<String, String> current = currentTags.get(child.getTbname());
+                if (!tagsEqual(meta, current, child.getTagValues())) {
+                    needReset.add(child);
+                }
+            }
+
+            if (!needReset.isEmpty()) {
+                conn.execute(buildBatchAlterChildTableTagSql(needReset, meta));
+                for (ChildTableMeta child : needReset) {
+                    createdChildTables.add(stableName + ":" + child.getTbname());
+                }
+                reset = needReset.size();
+            } else {
+                for (ChildTableMeta child : existing) {
+                    createdChildTables.add(stableName + ":" + child.getTbname());
+                }
+            }
+        }
+
+        return new int[]{created, reset};
+    }
+
+    private Map<String, LinkedHashMap<String, String>> queryChildTableTags(String database, String stableName,
+                                                                           SuperTableMeta meta,
+                                                                           List<ChildTableMeta> children,
+                                                                           TdConnection conn) {
+        Map<String, LinkedHashMap<String, String>> result = new LinkedHashMap<>();
+        if (children.isEmpty()) {
+            return result;
+        }
+
+        List<String> names = new ArrayList<>(children.size());
+        for (ChildTableMeta child : children) {
+            names.add(child.getTbname());
+        }
+
+        StringBuilder sql = new StringBuilder("SELECT TBNAME");
+        for (DataColumn tag : meta.getTags()) {
+            sql.append(", `").append(tag.getName()).append("`");
+        }
+        sql.append(" FROM ").append(database).append('.').append(stableName).append(" WHERE tbname IN (");
+        for (int i = 0; i < names.size(); i++) {
+            if (i > 0) sql.append(", ");
+            sql.append('\'').append(names.get(i).replace("'", "\\'")).append('\'');
+        }
+        sql.append(") GROUP BY TBNAME");
+
+        conn.query(sql.toString(), rs -> {
+            while (rs.next()) {
+                String tbname = rs.getString(1);
+                if (tbname == null || tbname.isBlank()) continue;
+                LinkedHashMap<String, String> tagVals = new LinkedHashMap<>();
+                int colIdx = 2;
+                for (DataColumn tag : meta.getTags()) {
+                    Object val = rs.getObject(colIdx++);
+                    tagVals.put(tag.getName(), val != null ? val.toString() : null);
+                }
+                result.put(tbname, tagVals);
+            }
+        });
+
+        return result;
+    }
+
+    private boolean tagsEqual(SuperTableMeta meta, LinkedHashMap<String, String> current,
+                              LinkedHashMap<String, String> expected) {
+        if (current == null || expected == null) {
+            return false;
+        }
+        for (DataColumn tag : meta.getTags()) {
+            String name = tag.getName();
+            if (!Objects.equals(current.get(name), expected.get(name))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private String buildBatchCreateChildTableSql(String stableName, List<ChildTableMeta> children, SuperTableMeta meta) {
+        StringBuilder sql = new StringBuilder();
+        for (int i = 0; i < children.size(); i++) {
+            if (i > 0) sql.append(' ');
+            ChildTableMeta child = children.get(i);
+            sql.append("CREATE TABLE IF NOT EXISTS `").append(child.getTbname()).append('`')
+                    .append(" USING `").append(stableName).append("` TAGS (");
+            appendTagValues(sql, meta, child.getTagValues());
+            sql.append(')');
+        }
+        return sql.toString();
+    }
+
+    private String buildBatchAlterChildTableTagSql(List<ChildTableMeta> children, SuperTableMeta meta) {
+        StringBuilder sql = new StringBuilder();
+        sql.append("ALTER TABLE ");
+        for (int i = 0; i < children.size(); i++) {
+            if (i > 0) sql.append(' ');
+            ChildTableMeta child = children.get(i);
+            sql.append('`').append(child.getTbname()).append('`').append(" SET TAG ");
+            appendNamedTagValues(sql, meta, child.getTagValues());
+        }
+        return sql.toString();
+    }
+
+    private void appendTagValues(StringBuilder sql, SuperTableMeta meta, LinkedHashMap<String, String> tagValues) {
+        boolean first = true;
+        for (DataColumn tag : meta.getTags()) {
+            if (!first) sql.append(", ");
+            sql.append(formatSqlValue(tagValues.get(tag.getName())));
+            first = false;
+        }
+    }
+
+    private void appendNamedTagValues(StringBuilder sql, SuperTableMeta meta, LinkedHashMap<String, String> tagValues) {
+        boolean first = true;
+        for (DataColumn tag : meta.getTags()) {
+            if (!first) sql.append(", ");
+            sql.append(tag.getName()).append('=').append(formatSqlValue(tagValues.get(tag.getName())));
+            first = false;
         }
     }
 
@@ -692,14 +887,7 @@ public class TdDataImporter implements DataImporter {
             // Track child tables created ON THIS CONNECTION to avoid USING TAGS on confirmed tables
             Set<String> locallyCreated = new HashSet<>();
             // If child table manifest is loaded, pre-populate with all known child tables for this super table
-            if (hasChildTableManifest) {
-                String prefix = stableName + ":";
-                for (String key : createdChildTables) {
-                    if (key.startsWith(prefix)) {
-                        locallyCreated.add(key);
-                    }
-                }
-            }
+            locallyCreated.addAll(createdChildTables);
 
             for (Map.Entry<String, List<String>> entry : grouped.entrySet()) {
                 String tbname = entry.getKey();

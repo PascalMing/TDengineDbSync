@@ -42,6 +42,8 @@ public class SyncProperties {
     private List<String> superTables = new ArrayList<>();
     /** Common non-time export conditions applied to all super tables */
     private String exportConditions = "";
+    /** Whether export queries should add ORDER BY timestamp ASC. Default false for throughput. */
+    private boolean exportOrderByTs = false;
     /** Per-super-table additional export conditions, keyed by stable name */
     private Map<String, String> stableConditions = new HashMap<>();
     /** Export start time (inclusive). Format: "yyyy-MM-dd" or "yyyy-MM-dd HH:mm:ss". Blank=auto-detect. */
@@ -135,6 +137,14 @@ public class SyncProperties {
 
     public void setExportConditions(String exportConditions) {
         this.exportConditions = exportConditions;
+    }
+
+    public boolean isExportOrderByTs() {
+        return exportOrderByTs;
+    }
+
+    public void setExportOrderByTs(boolean exportOrderByTs) {
+        this.exportOrderByTs = exportOrderByTs;
     }
 
     public Map<String, String> getStableConditions() {
