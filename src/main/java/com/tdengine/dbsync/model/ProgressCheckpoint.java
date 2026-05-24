@@ -7,12 +7,15 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Progress checkpoint file for resume support.
  * Stored as {database}_progress.json in the data directory.
  */
 public class ProgressCheckpoint {
+
+    private int version = 2;
 
     private String database;
 
@@ -22,13 +25,21 @@ public class ProgressCheckpoint {
     private LocalDateTime lastUpdateTime;
 
     /** Per-super-table progress: stableName -> StableProgress */
-    private Map<String, StableProgress> stables = new LinkedHashMap<>();
+    private Map<String, StableProgress> stables = new ConcurrentHashMap<>();
 
     /** Time range used for this export run (for resume validation) */
     private String timeRangeStart;
     private String timeRangeEnd;
 
     public ProgressCheckpoint() {
+    }
+
+    public int getVersion() {
+        return version;
+    }
+
+    public void setVersion(int version) {
+        this.version = version;
     }
 
     public String getDatabase() {
@@ -60,7 +71,7 @@ public class ProgressCheckpoint {
     }
 
     public void setStables(Map<String, StableProgress> stables) {
-        this.stables = stables;
+        this.stables = stables == null ? new ConcurrentHashMap<>() : new ConcurrentHashMap<>(stables);
     }
 
     public StableProgress getOrCreateStable(String stableName) {

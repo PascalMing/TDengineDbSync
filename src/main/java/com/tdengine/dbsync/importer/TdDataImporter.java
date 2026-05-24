@@ -2,9 +2,13 @@ package com.tdengine.dbsync.importer;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.MappingIterator;
 import com.tdengine.dbsync.config.SyncProperties;
 import com.tdengine.dbsync.connection.TdConnection;
 import com.tdengine.dbsync.connection.TdConnectionFactory;
+import com.tdengine.dbsync.model.ChildTableManifest;
 import com.tdengine.dbsync.model.ChildTableMeta;
 import com.tdengine.dbsync.model.DataColumn;
 import com.tdengine.dbsync.model.ProgressCheckpoint;
@@ -24,6 +28,7 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class TdDataImporter implements DataImporter {
 
@@ -33,6 +38,96 @@ public class TdDataImporter implements DataImporter {
     private static final char FIELD_SEP = '\t';
     private static final String NULL_MARKER = "\\N";
     private static final int CHILD_TABLE_BATCH_SIZE = 200;
+
+    private static final class FileBatch {
+        final String fileKey;
+        final int batchIndex;
+        final List<String> lines;
+        final FileWorkTracker tracker;
+        final boolean poison;
+
+        private FileBatch(String fileKey, int batchIndex, List<String> lines, FileWorkTracker tracker, boolean poison) {
+            this.fileKey = fileKey;
+            this.batchIndex = batchIndex;
+            this.lines = lines;
+            this.tracker = tracker;
+            this.poison = poison;
+        }
+
+        static FileBatch data(String fileKey, int batchIndex, List<String> lines, FileWorkTracker tracker) {
+            return new FileBatch(fileKey, batchIndex, lines, tracker, false);
+        }
+
+        static FileBatch poison() {
+            return new FileBatch(null, -1, Collections.emptyList(), null, true);
+        }
+    }
+
+    private static final class FileWorkTracker {
+        private final AtomicInteger pendingBatches = new AtomicInteger(0);
+        private final AtomicLong insertedRows = new AtomicLong(0);
+        private final Map<Integer, Integer> batchSizes = new ConcurrentHashMap<>();
+        private final Set<Integer> completedBatches = ConcurrentHashMap.newKeySet();
+        private final AtomicInteger nextCommittedBatch = new AtomicInteger(0);
+        private final AtomicLong committedOffset = new AtomicLong(0);
+
+        void addBatch(int batchIndex, int batchSize) {
+            batchSizes.put(batchIndex, batchSize);
+            pendingBatches.incrementAndGet();
+        }
+
+        long batchCompleted(int batchIndex, long inserted) {
+            insertedRows.addAndGet(inserted);
+            completedBatches.add(batchIndex);
+            synchronized (this) {
+                advanceCommittedOffsetLocked();
+                if (pendingBatches.decrementAndGet() <= 0) {
+                    notifyAll();
+                }
+            }
+            return committedOffset.get();
+        }
+
+        void batchFailed() {
+            synchronized (this) {
+                if (pendingBatches.decrementAndGet() <= 0) {
+                    notifyAll();
+                }
+            }
+        }
+
+        long getInsertedRows() {
+            return insertedRows.get();
+        }
+
+        long getCommittedOffset() {
+            return committedOffset.get();
+        }
+
+        void awaitCompletion(AtomicBoolean errorFlag) throws InterruptedException {
+            synchronized (this) {
+                while (pendingBatches.get() > 0 && !errorFlag.get()) {
+                    wait(250L);
+                }
+            }
+        }
+
+        private void advanceCommittedOffsetLocked() {
+            while (true) {
+                int nextBatch = nextCommittedBatch.get();
+                if (!completedBatches.contains(nextBatch)) {
+                    return;
+                }
+                Integer batchSize = batchSizes.remove(nextBatch);
+                if (batchSize == null) {
+                    return;
+                }
+                completedBatches.remove(nextBatch);
+                committedOffset.addAndGet(batchSize);
+                nextCommittedBatch.incrementAndGet();
+            }
+        }
+    }
 
     private final SyncProperties properties;
     private final TdConnectionFactory connectionFactory;
@@ -68,6 +163,12 @@ public class TdDataImporter implements DataImporter {
         ProgressCheckpoint checkpoint = checkpointManager.getCheckpoint();
         if (checkpoint != null && !checkpoint.getStables().isEmpty()) {
             log.info("Resuming from previous checkpoint...");
+            for (var entry : checkpoint.getStables().entrySet()) {
+                var sp = entry.getValue();
+                log.info("  [{}] completedFiles={}, currentFile={}, currentFileOffset={}, totalRecords={}",
+                        entry.getKey(), sp.getCompletedFiles().size(), sp.getCurrentFile(),
+                        sp.getCurrentFileOffset(), sp.getTotalRecords());
+            }
         }
 
         Path schemaPath = dataDir.resolve(sourceDb + "_schema.json");
@@ -121,16 +222,23 @@ public class TdDataImporter implements DataImporter {
                 f.get();
             } catch (ExecutionException e) {
                 Throwable cause = e.getCause();
-                errors.add(cause instanceof Exception ex ? ex : new RuntimeException(cause));
+                if (cause instanceof Exception ex) {
+                    errors.add(ex);
+                } else if (cause != null) {
+                    errors.add(new RuntimeException(cause));
+                } else {
+                    errors.add(new RuntimeException(e));
+                }
             }
         }
 
         if (!errors.isEmpty()) {
             for (Exception err : errors) {
-                log.error("Import error: {}", err.getMessage());
+                log.error("Import error: {}: {}", err.getClass().getName(), err.getMessage(), err);
             }
+            Exception first = errors.getFirst();
             throw new RuntimeException("Import failed: " + errors.size() + " super table(s) had errors. " +
-                    "First error: " + errors.getFirst().getMessage());
+                    "First error: " + first.getClass().getName() + ": " + first.getMessage(), first);
         }
 
         checkpointManager.delete();
@@ -239,19 +347,19 @@ public class TdDataImporter implements DataImporter {
         int resetCount = 0;
         int scannedCount = 0;
 
-        List<ChildTableMeta> batch = new ArrayList<>(CHILD_TABLE_BATCH_SIZE);
-        try (InputStream fis = Files.newInputStream(manifestPath);
-             GzipCompressorInputStream gzipIn = new GzipCompressorInputStream(fis);
-             BufferedReader reader = new BufferedReader(new InputStreamReader(gzipIn, StandardCharsets.UTF_8), 131072)) {
+        try {
+            List<ChildTableMeta> allChildren = readChildTableManifest(manifestPath, stableName);
+            if (allChildren.isEmpty()) {
+                throw new RuntimeException("Child table manifest is empty: " + manifestPath);
+            }
 
-            String line;
-            while ((line = reader.readLine()) != null) {
-                if (line.isBlank()) continue;
-                ChildTableMeta child = objectMapper.readValue(line, ChildTableMeta.class);
-                if (child.getTbname() == null || child.getTbname().isBlank()) continue;
+            List<ChildTableMeta> batch = new ArrayList<>(CHILD_TABLE_BATCH_SIZE);
+            for (ChildTableMeta child : allChildren) {
+                if (child == null || child.getTbname() == null || child.getTbname().isBlank()) {
+                    continue;
+                }
                 batch.add(child);
                 scannedCount++;
-
                 if (batch.size() >= CHILD_TABLE_BATCH_SIZE) {
                     int[] counts = reconcileChildTableBatch(database, stableName, meta, batch, existingChildTables, conn);
                     createdCount += counts[0];
@@ -273,6 +381,35 @@ public class TdDataImporter implements DataImporter {
         }
     }
 
+    private List<ChildTableMeta> readChildTableManifest(Path manifestPath, String stableName) throws Exception {
+        try (InputStream fis = Files.newInputStream(manifestPath);
+             GzipCompressorInputStream gzipIn = new GzipCompressorInputStream(fis);
+             BufferedInputStream bufferedIn = new BufferedInputStream(gzipIn, 131072);
+             JsonParser parser = objectMapper.getFactory().createParser(bufferedIn)) {
+
+            JsonNode firstNode = objectMapper.readTree(parser);
+            if (firstNode == null) {
+                return Collections.emptyList();
+            }
+
+            if (firstNode.has("superTables")) {
+                ChildTableManifest manifest = objectMapper.treeToValue(firstNode, ChildTableManifest.class);
+                List<ChildTableMeta> children = manifest.getSuperTables().get(stableName);
+                return children == null ? Collections.emptyList() : new ArrayList<>(children);
+            }
+
+            List<ChildTableMeta> children = new ArrayList<>();
+            children.add(objectMapper.treeToValue(firstNode, ChildTableMeta.class));
+
+            MappingIterator<ChildTableMeta> iterator = objectMapper.readerFor(ChildTableMeta.class).readValues(parser);
+            while (iterator.hasNextValue()) {
+                children.add(iterator.nextValue());
+            }
+
+            return children;
+        }
+    }
+
     private int[] reconcileChildTableBatch(String database, String stableName, SuperTableMeta meta,
                                            List<ChildTableMeta> batch, Set<String> existingChildTables,
                                            TdConnection conn) throws Exception {
@@ -291,7 +428,9 @@ public class TdDataImporter implements DataImporter {
         int reset = 0;
 
         if (!missing.isEmpty()) {
-            conn.execute(buildBatchCreateChildTableSql(stableName, missing, meta));
+            for (ChildTableMeta child : missing) {
+                conn.execute(buildCreateChildTableSql(stableName, child, meta));
+            }
             for (ChildTableMeta child : missing) {
                 String key = stableName + ":" + child.getTbname();
                 createdChildTables.add(key);
@@ -311,7 +450,9 @@ public class TdDataImporter implements DataImporter {
             }
 
             if (!needReset.isEmpty()) {
-                conn.execute(buildBatchAlterChildTableTagSql(needReset, meta));
+                for (ChildTableMeta child : needReset) {
+                    conn.execute(buildAlterChildTableTagSql(child, meta));
+                }
                 for (ChildTableMeta child : needReset) {
                     createdChildTables.add(stableName + ":" + child.getTbname());
                 }
@@ -382,28 +523,19 @@ public class TdDataImporter implements DataImporter {
         return true;
     }
 
-    private String buildBatchCreateChildTableSql(String stableName, List<ChildTableMeta> children, SuperTableMeta meta) {
+    private String buildCreateChildTableSql(String stableName, ChildTableMeta child, SuperTableMeta meta) {
         StringBuilder sql = new StringBuilder();
-        for (int i = 0; i < children.size(); i++) {
-            if (i > 0) sql.append(' ');
-            ChildTableMeta child = children.get(i);
-            sql.append("CREATE TABLE IF NOT EXISTS `").append(child.getTbname()).append('`')
-                    .append(" USING `").append(stableName).append("` TAGS (");
-            appendTagValues(sql, meta, child.getTagValues());
-            sql.append(')');
-        }
+        sql.append("CREATE TABLE IF NOT EXISTS `").append(child.getTbname()).append('`')
+                .append(" USING `").append(stableName).append("` TAGS (");
+        appendTagValues(sql, meta, child.getTagValues());
+        sql.append(')');
         return sql.toString();
     }
 
-    private String buildBatchAlterChildTableTagSql(List<ChildTableMeta> children, SuperTableMeta meta) {
+    private String buildAlterChildTableTagSql(ChildTableMeta child, SuperTableMeta meta) {
         StringBuilder sql = new StringBuilder();
-        sql.append("ALTER TABLE ");
-        for (int i = 0; i < children.size(); i++) {
-            if (i > 0) sql.append(' ');
-            ChildTableMeta child = children.get(i);
-            sql.append('`').append(child.getTbname()).append('`').append(" SET TAG ");
-            appendNamedTagValues(sql, meta, child.getTagValues());
-        }
+        sql.append("ALTER TABLE `").append(child.getTbname()).append("` SET TAG ");
+        appendNamedTagValues(sql, meta, child.getTagValues());
         return sql.toString();
     }
 
@@ -525,12 +657,13 @@ public class TdDataImporter implements DataImporter {
         int queueSize = properties.getPipelineQueueSize();
         int writerThreads = properties.getParallel();
 
-        BlockingQueue<List<String>> batchQueue = new LinkedBlockingQueue<>(queueSize);
-        List<String> POISON = List.of("__POISON__");
+        BlockingQueue<FileBatch> batchQueue = new LinkedBlockingQueue<>(queueSize);
+        FileBatch POISON = FileBatch.poison();
 
         AtomicBoolean error = new AtomicBoolean(false);
         AtomicLong totalRecords = new AtomicLong(sp != null ? sp.getTotalRecords() : 0);
         AtomicLong lastProgressTime = new AtomicLong(System.currentTimeMillis());
+        AtomicLong lastCheckpointSaveTime = new AtomicLong(System.currentTimeMillis());
 
         // Per-pipeline context (NOT shared across super tables)
         PipelineCtx ctx = new PipelineCtx();
@@ -551,13 +684,17 @@ public class TdDataImporter implements DataImporter {
                     writeConn.execute("USE " + database);
 
                     while (true) {
-                        List<String> batch = batchQueue.take();
-                        if (batch == POISON) break;
+                        FileBatch job = batchQueue.take();
+                        if (job.poison) break;
                         if (error.get()) break;
 
                         try {
-                            int inserted = insertBatch(stableName, tagColumnNames, batch, writeConn, ctx);
+                            int inserted = insertBatch(stableName, meta, tagColumnNames, job.lines, writeConn, ctx);
                             totalRecords.addAndGet(inserted);
+                            long committedOffset = job.tracker != null ? job.tracker.batchCompleted(job.batchIndex, inserted) : 0;
+                            if (job.tracker != null) {
+                                maybeUpdateFileCheckpoint(sp, job.fileKey, committedOffset, totalRecords, lastCheckpointSaveTime);
+                            }
 
                             long now = System.currentTimeMillis();
                             if (now - lastProgressTime.get() >= PROGRESS_LOG_INTERVAL_MS) {
@@ -567,6 +704,9 @@ public class TdDataImporter implements DataImporter {
                         } catch (Exception e) {
                             log.error("  [{}] Batch insert failed (writer-{}): {}", stableName, consumerId, e.getMessage());
                             error.set(true);
+                            if (job.tracker != null) {
+                                job.tracker.batchFailed();
+                            }
                             break;
                         }
                     }
@@ -591,7 +731,6 @@ public class TdDataImporter implements DataImporter {
 
                 if (sp != null && sp.isFileCompleted(fileKey)) {
                     long completedRecords = sp.getCompletedFiles().get(fileKey);
-                    totalRecords.addAndGet(completedRecords);
                     log.info("  [{}] Skipping already imported file: {} ({} records)",
                             stableName, fileKey, completedRecords);
                     continue;
@@ -606,6 +745,8 @@ public class TdDataImporter implements DataImporter {
                 }
 
                 long fileRecordCount = 0;
+                FileWorkTracker fileTracker = new FileWorkTracker();
+                int batchIndex = 0;
 
                 try (InputStream fis = Files.newInputStream(dataFile);
                      GzipCompressorInputStream gzipIn = new GzipCompressorInputStream(fis);
@@ -645,6 +786,8 @@ public class TdDataImporter implements DataImporter {
                         }
                         fileRecordCount = fileOffset;
                         log.info("  [{}] Resumed file {} from line {}", stableName, fileKey, fileOffset);
+                    } else {
+                        log.info("  [{}] Starting file {} from the beginning", stableName, fileKey);
                     }
 
                     List<String> batchLines = new ArrayList<>(batchSize);
@@ -658,23 +801,54 @@ public class TdDataImporter implements DataImporter {
                         fileRecordCount++;
 
                         if (batchLines.size() >= batchSize) {
-                            batchQueue.put(new ArrayList<>(batchLines));
+                            fileTracker.addBatch(batchIndex, batchLines.size());
+                            batchQueue.put(FileBatch.data(fileKey, batchIndex, new ArrayList<>(batchLines), fileTracker));
                             batchLines.clear();
+                            batchIndex++;
                         }
                     }
 
                     if (!batchLines.isEmpty()) {
-                        batchQueue.put(new ArrayList<>(batchLines));
+                        fileTracker.addBatch(batchIndex, batchLines.size());
+                        batchQueue.put(FileBatch.data(fileKey, batchIndex, new ArrayList<>(batchLines), fileTracker));
                     }
                 }
 
+                try {
+                    fileTracker.awaitCompletion(error);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException("Interrupted while waiting for file batches to finish: " + fileKey, e);
+                }
+
+                long insertedRows = fileTracker.getInsertedRows();
+                log.info("  [{}] File {} finished: read {} rows, inserted {} rows",
+                        stableName, fileKey, fileRecordCount, insertedRows);
+                log.info("  [{}] File {} checkpoint state: currentFile={}, currentFileOffset={}, completedFiles={}",
+                        stableName, fileKey,
+                        sp != null ? sp.getCurrentFile() : null,
+                        sp != null ? sp.getCurrentFileOffset() : 0,
+                        sp != null ? sp.getCompletedFiles().size() : 0);
+
                 if (sp != null && !error.get()) {
-                    sp.markFileCompleted(fileKey, fileRecordCount);
-                    sp.setTotalRecords(totalRecords.get());
+                    sp.setCurrentFileOffset(fileTracker.getCommittedOffset());
+                    sp.setCurrentFile(fileTracker.getCommittedOffset() >= fileRecordCount ? null : fileKey);
                     checkpointManager.markDirty();
                 }
 
-                log.info("  [{}] File {} completed: {} records", stableName, fileKey, fileRecordCount);
+                if (sp != null && !error.get() && fileRecordCount == insertedRows) {
+                    sp.markFileCompleted(fileKey, fileRecordCount);
+                    sp.setTotalRecords(totalRecords.get());
+                    checkpointManager.markDirty();
+                } else if (sp != null && !error.get()) {
+                    log.warn("  [{}] File {} not checkpointed because read/inserted mismatch: {} vs {}",
+                            stableName, fileKey, fileRecordCount, insertedRows);
+                }
+
+                if (fileRecordCount != insertedRows) {
+                    log.warn("  [{}] File {} mismatch: read {} rows, inserted {} rows",
+                            stableName, fileKey, fileRecordCount, insertedRows);
+                }
             }
         } finally {
             // Send one POISON per consumer to signal all to stop
@@ -692,6 +866,24 @@ public class TdDataImporter implements DataImporter {
 
         checkpointManager.saveIfDirty();
         log.info("  [{}] Import completed: total {} records", stableName, totalRecords.get());
+    }
+
+    private void maybeUpdateFileCheckpoint(ProgressCheckpoint.StableProgress sp, String fileKey,
+                                           long committedOffset, AtomicLong totalRecords,
+                                           AtomicLong lastCheckpointSaveTime) {
+        if (sp == null) {
+            return;
+        }
+        sp.setCurrentFile(fileKey);
+        sp.setCurrentFileOffset(committedOffset);
+        sp.setTotalRecords(totalRecords.get());
+        checkpointManager.markDirty();
+
+        long now = System.currentTimeMillis();
+        if (now - lastCheckpointSaveTime.get() >= CHECKPOINT_SAVE_INTERVAL_MS) {
+            checkpointManager.saveIfDirty();
+            lastCheckpointSaveTime.set(now);
+        }
     }
 
     // ---- Pipeline context (per-super-table) ----
@@ -847,14 +1039,14 @@ public class TdDataImporter implements DataImporter {
     /**
      * Insert a batch of records. Now takes a connection parameter for multi-writer support.
      */
-    private int insertBatch(String stableName, Set<String> tagColumnNames, List<String> batchLines,
-                             TdConnection conn, PipelineCtx ctx) {
+    private int insertBatch(String stableName, SuperTableMeta meta, Set<String> tagColumnNames, List<String> batchLines,
+                              TdConnection conn, PipelineCtx ctx) {
         if (batchLines.isEmpty()) return 0;
 
         try {
             // Per-child-table format (new export style): all lines belong to one child table
             if (ctx.currentFileChildTable != null) {
-                return insertBatchToChildTable(stableName, batchLines, conn, ctx);
+                return insertBatchToChildTable(stableName, meta, batchLines, conn, ctx);
             }
 
             // Group by child table (tbname)
@@ -877,13 +1069,6 @@ public class TdDataImporter implements DataImporter {
                 grouped.computeIfAbsent(tbname, k -> new ArrayList<>()).add(line);
             }
 
-            // Pre-allocate: rough estimate of SQL size
-            int estimatedBytes = batchLines.size() * 96;
-            StringBuilder sql = new StringBuilder(estimatedBytes);
-            sql.append("INSERT INTO ");
-
-            boolean firstTable = true;
-
             // Track child tables created ON THIS CONNECTION to avoid USING TAGS on confirmed tables
             Set<String> locallyCreated = new HashSet<>();
             // If child table manifest is loaded, pre-populate with all known child tables for this super table
@@ -894,12 +1079,10 @@ public class TdDataImporter implements DataImporter {
                 List<String> tableRecords = entry.getValue();
                 if (tableRecords.isEmpty()) continue;
 
-                if (!firstTable) sql.append(' ');
-                firstTable = false;
-
                 String childTableKey = stableName + ":" + tbname;
 
-                sql.append('`').append(tbname).append('`');
+                StringBuilder sql = new StringBuilder(tableRecords.size() * 96 + 64);
+                sql.append("INSERT INTO `").append(tbname).append('`');
 
                 // Use connection-local cache to avoid TDengine REST mode visibility issues:
                 // If this connection has already created this child table locally, no USING needed.
@@ -926,21 +1109,21 @@ public class TdDataImporter implements DataImporter {
                     if (i > 0) sql.append(' ');
 
                     if (properties.getFormat() == SyncProperties.DataFormat.CSV) {
-                        appendCsvValues(sql, tableRecords.get(i), ctx);
+                        appendCsvValues(sql, tableRecords.get(i), ctx, meta);
                     } else {
                         appendJsonValues(sql, tableRecords.get(i), tagColumnNames);
                     }
                 }
-            }
 
-            String fullSql = sql.toString();
-            try {
-                conn.execute(fullSql);
-            } catch (Exception e) {
-                // Log full SQL for debugging, then rethrow
-                log.error("Batch insert FAILED for super table {}:\n  SQL (first 2000 chars): {}\n  Error: {}",
-                        stableName, fullSql.substring(0, Math.min(fullSql.length(), 2000)), e.getMessage());
-                throw new RuntimeException("Batch insert failed: " + e.getMessage(), e);
+                String groupSql = sql.toString();
+                try {
+                    conn.execute(groupSql);
+                } catch (Exception e) {
+                    // Log full SQL for debugging, then rethrow
+                    log.error("Batch insert FAILED for super table {}, child table {}:\n  SQL (first 2000 chars): {}\n  Error: {}",
+                            stableName, tbname, groupSql.substring(0, Math.min(groupSql.length(), 2000)), e.getMessage());
+                    throw new RuntimeException("Batch insert failed: " + e.getMessage(), e);
+                }
             }
             return batchLines.size();
         } catch (Exception e) {
@@ -954,8 +1137,8 @@ public class TdDataImporter implements DataImporter {
      * All lines in the batch belong to one child table, values are data columns only.
      * The child table is already created by the manifest, so no USING TAGS needed.
      */
-    private int insertBatchToChildTable(String stableName, List<String> batchLines,
-                                         TdConnection conn, PipelineCtx ctx) {
+    private int insertBatchToChildTable(String stableName, SuperTableMeta meta, List<String> batchLines,
+                                          TdConnection conn, PipelineCtx ctx) {
         String childTable = ctx.currentFileChildTable;
         int estimated = Math.max(batchLines.size() * 64, 256);
         StringBuilder sql = new StringBuilder(estimated);
@@ -964,19 +1147,7 @@ public class TdDataImporter implements DataImporter {
         for (int i = 0; i < batchLines.size(); i++) {
             if (i > 0) sql.append(' ');
             if (properties.getFormat() == SyncProperties.DataFormat.CSV) {
-                // CSV values are data columns only: all fields are values
-                String[] fields = parseCsvLine(batchLines.get(i));
-                sql.append('(');
-                for (int j = 0; j < fields.length; j++) {
-                    if (j > 0) sql.append(", ");
-                    String val = fields[j];
-                    if (NULL_MARKER.equals(val)) {
-                        sql.append("NULL");
-                    } else {
-                        sql.append(formatSqlValue(val));
-                    }
-                }
-                sql.append(')');
+                appendCsvValuesForChildTable(sql, batchLines.get(i), ctx, meta);
             } else {
                 // JSON: exclude tbname and tag_ fields
                 appendJsonValuesForChildTable(sql, batchLines.get(i));
@@ -991,6 +1162,49 @@ public class TdDataImporter implements DataImporter {
             throw new RuntimeException("Batch insert failed: " + e.getMessage(), e);
         }
         return batchLines.size();
+    }
+
+    /**
+     * Append a CSV line for per-child-table files.
+     * Newer exports may still include tbname/tag columns in the file, so we skip them here.
+     */
+    private void appendCsvValuesForChildTable(StringBuilder sql, String line, PipelineCtx ctx, SuperTableMeta meta) {
+        String[] fields = parseCsvLine(line);
+        String[] header = ctx.header;
+        int dataColumnCount = meta != null && meta.getColumns() != null ? meta.getColumns().size() : fields.length;
+
+        sql.append('(');
+        boolean first = true;
+
+        if (header != null && header.length == fields.length) {
+            int startIdx = ctx.hasTbname ? 1 : 0;
+            int endIdx = Math.min(fields.length, startIdx + dataColumnCount);
+            for (int i = startIdx; i < endIdx; i++) {
+                if (!first) sql.append(", ");
+                String val = fields[i];
+                if (NULL_MARKER.equals(val)) {
+                    sql.append("NULL");
+                } else {
+                    sql.append(formatSqlValue(val));
+                }
+                first = false;
+            }
+        } else {
+            // Fallback: assume file already contains only data columns.
+            int endIdx = Math.min(fields.length, dataColumnCount);
+            for (int i = 0; i < endIdx; i++) {
+                if (!first) sql.append(", ");
+                String val = fields[i];
+                if (NULL_MARKER.equals(val)) {
+                    sql.append("NULL");
+                } else {
+                    sql.append(formatSqlValue(val));
+                }
+                first = false;
+            }
+        }
+
+        sql.append(')');
     }
 
     /**
@@ -1067,17 +1281,15 @@ public class TdDataImporter implements DataImporter {
     /**
      * Append data values from CSV line, excluding tbname (when present) and tag columns.
      */
-    private void appendCsvValues(StringBuilder sql, String line, PipelineCtx ctx) {
+    private void appendCsvValues(StringBuilder sql, String line, PipelineCtx ctx, SuperTableMeta meta) {
         String[] fields = parseCsvLine(line);
-        Set<Integer> tagIndices = ctx.tagColumnIndices;
+        int dataColumnCount = meta != null && meta.getColumns() != null ? meta.getColumns().size() : fields.length;
 
         sql.append('(');
         boolean first = true;
         int startIdx = ctx.hasTbname ? 1 : 0;
-        for (int i = startIdx; i < fields.length; i++) {
-            // Skip tag columns (they go in TAGS clause)
-            if (tagIndices != null && tagIndices.contains(i)) continue;
-
+        int endIdx = Math.min(fields.length, startIdx + dataColumnCount);
+        for (int i = startIdx; i < endIdx; i++) {
             if (!first) sql.append(", ");
             String val = fields[i];
             if (NULL_MARKER.equals(val)) {

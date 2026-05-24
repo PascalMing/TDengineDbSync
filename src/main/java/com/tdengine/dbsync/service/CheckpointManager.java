@@ -22,6 +22,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class CheckpointManager {
 
     private static final Logger log = LoggerFactory.getLogger(CheckpointManager.class);
+    private static final int CURRENT_CHECKPOINT_VERSION = 2;
 
     private final SyncProperties properties;
     private final ObjectMapper objectMapper;
@@ -43,10 +44,17 @@ public class CheckpointManager {
     public synchronized void init() {
         Path dataDir = Path.of(properties.getDataDir(), properties.getDatabase());
         checkpointPath = dataDir.resolve(properties.getDatabase() + "_progress.json");
+        log.info("Checkpoint path: {}", checkpointPath);
 
         if (Files.exists(checkpointPath)) {
             try {
                 checkpoint = objectMapper.readValue(checkpointPath.toFile(), ProgressCheckpoint.class);
+                if (checkpoint.getVersion() != CURRENT_CHECKPOINT_VERSION) {
+                    log.warn("Checkpoint version mismatch (found {}, expected {}), starting fresh",
+                            checkpoint.getVersion(), CURRENT_CHECKPOINT_VERSION);
+                    checkpoint = createNewCheckpoint();
+                    return;
+                }
                 log.info("Loaded existing checkpoint: mode={}, updated={}", checkpoint.getMode(), checkpoint.getLastUpdateTime());
                 logCheckpointSummary();
             } catch (Exception e) {
@@ -60,6 +68,7 @@ public class CheckpointManager {
 
     private ProgressCheckpoint createNewCheckpoint() {
         ProgressCheckpoint cp = new ProgressCheckpoint();
+        cp.setVersion(CURRENT_CHECKPOINT_VERSION);
         cp.setDatabase(properties.getDatabase());
         cp.setMode(properties.getMode().name());
         cp.setLastUpdateTime(LocalDateTime.now());
@@ -70,9 +79,9 @@ public class CheckpointManager {
         if (checkpoint == null) return;
         for (var entry : checkpoint.getStables().entrySet()) {
             var sp = entry.getValue();
-            log.info("  Checkpoint [{}]: schemaDone={}, completedFiles={}, currentFile={}, totalRecords={}",
+            log.info("  Checkpoint [{}]: schemaDone={}, completedFiles={}, currentFile={}, currentFileOffset={}, totalRecords={}",
                     entry.getKey(), sp.isSchemaDone(), sp.getCompletedFiles().size(),
-                    sp.getCurrentFile(), sp.getTotalRecords());
+                    sp.getCurrentFile(), sp.getCurrentFileOffset(), sp.getTotalRecords());
         }
     }
 

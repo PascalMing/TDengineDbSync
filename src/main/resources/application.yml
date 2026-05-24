@@ -15,7 +15,7 @@ tdengine:
     username: root
     password: taosdata
   # Run mode: export / import
-  mode: export
+  mode: import
   # Data directory for export/import files
   data-dir: ./data
   # Target database name

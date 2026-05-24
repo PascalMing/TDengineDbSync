@@ -27,14 +27,14 @@ TDengine 3.0+ 数据库数据导出与导入工具，基于 Java 21 + Spring Boo
 - **数据压缩**: Gzip 压缩，按块大小（默认10W条）分文件
 - **组合查询条件**: 结构化时间范围(start-time/end-time) + 通用非时间条件 + 超级表级别附加条件
 - **按天拆分**: 导出自动按天迭代，每天独立子目录 `{yyyyMMdd}/`，数据文件按天组织
-- **断点恢复**: 天级+时间戳双重导出恢复 + 基于文件/行偏移的导入恢复
+- **断点恢复**: 天级+时间戳双重导出恢复 + 基于文件/已提交行偏移的导入恢复
 - **Schema一致性校验**: 导入时比对超级表DDL，不一致终止并提示
 - **高效导入**: 多消费者并行写入、生产者-消费者流水线、子表先创建后仅插入、多表合并INSERT、**多超级表并行导入**
 - **连接池**: 基于Semaphore的连接池，限制最大并发连接数，避免连接泄露
 - **子表名保持**: CSV 含 `tbname` 列，导入时直接使用原始子表名（REST API模式也支持）
 - **子表清单**: 导出时自动生成流式子表清单，导入时按目标库现状差集补建并重置 tag
 - **导出/导入库分离**: 支持导出库与导入库不同名，通过 `target-database` 配置
-- **进度日志**: 每10秒输出一次进度，优雅退出时保存断点
+- **进度日志**: 每10秒输出一次进度，启动时打印断点摘要，优雅退出时保存断点
 
 ---
 
@@ -438,7 +438,7 @@ JDBC 原生连接始终使用 `SHOW STABLES`，不受此问题影响。
   2024-01-04: 正常导出
 ```
 
-### 导入断点: 基于文件+行偏移
+### 导入断点: 基于文件+已提交行偏移
 
 ```
 导入3个文件, 在第2个文件第3000行时中断:
@@ -451,6 +451,11 @@ JDBC 原生连接始终使用 `SHOW STABLES`，不受此问题影响。
   - st1_20240102.gz: 跳过前3000行, 从第3001行继续
   - st1_20240103.gz: 正常导入
 ```
+
+说明:
+- 导入恢复按“已成功提交的 batch 前缀”推进
+- 如果中断发生在最后一个未提交 batch 中，这个 batch 会在下次启动时重放
+- 不会在导入前删除目标数据库，已存在数据会保留并按现状继续导入
 
 ### 断点文件格式 (`{database}_progress.json`)
 
@@ -814,8 +819,10 @@ java -jar dbsync-1.0.0.jar --tdengine.mode=export --tdengine.database=iot_db
 java -jar dbsync-1.0.0.jar --tdengine.mode=export --tdengine.database=iot_db
 
 # 日志输出:
+# Checkpoint path: ./data/iot_db/iot_db_progress.json
 # Resuming from previous checkpoint...
-# Timestamp-based resume active, completed blocks excluded by WHERE clause
+#   [st1] completedFiles=..., currentFile=..., currentFileOffset=...
+#   [st1] Resumed file ... from line ...
 ```
 
 ### 示例7: 使用REST API连接 (无需安装TDengine客户端)
@@ -863,6 +870,8 @@ tdengine:
   database: hirun_node_monitor      # 即从 hirun_node_monitor 目录读取数据
   # target-database 未配置         # 同时导入到 hirun_node_monitor 库
 ```
+
+导入不会在开始前删除目标数据库；如果目标库里还有其他业务数据，会保持不动，仅按当前导入流程创建/校验相关超级表和子表并继续写入。
 
 ---
 

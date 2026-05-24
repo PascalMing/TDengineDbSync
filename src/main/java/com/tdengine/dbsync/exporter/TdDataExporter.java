@@ -59,7 +59,6 @@ public class TdDataExporter implements DataExporter {
         this.objectMapper = new ObjectMapper();
         this.objectMapper.registerModule(new JavaTimeModule());
         this.objectMapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
-        this.objectMapper.enable(SerializationFeature.INDENT_OUTPUT);
     }
 
     @Override
