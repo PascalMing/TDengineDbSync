@@ -3,8 +3,6 @@ package com.tdengine.dbsync.model;
 import com.fasterxml.jackson.annotation.JsonFormat;
 
 import java.time.LocalDateTime;
-import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -96,24 +94,25 @@ public class ProgressCheckpoint {
 
     /**
      * Per-super-table progress tracking.
+     * Thread-safe: used by parallel partition exporters concurrently.
      */
     public static class StableProgress {
         private boolean schemaDone;
         /** Completed block file names -> record count */
-        private Map<String, Long> completedFiles = new LinkedHashMap<>();
-        private String currentFile;
-        private long currentFileOffset;
+        private final Map<String, Long> completedFiles = new ConcurrentHashMap<>();
+        private volatile String currentFile;
+        private volatile long currentFileOffset;
         private long totalRecords;
         /**
          * Last exported timestamp (ISO format string).
          * Used for timestamp-based resume: WHERE ts > lastExportTs
          * instead of re-querying and skipping rows.
          */
-        private String lastExportTs;
+        private volatile String lastExportTs;
         /** Completed day strings (e.g. "2024-01-15") for day-level resume */
-        private Set<String> completedDays = new LinkedHashSet<>();
+        private final Set<String> completedDays = ConcurrentHashMap.newKeySet();
         /** Currently processing day string (e.g. "2024-01-15") */
-        private String currentDay;
+        private volatile String currentDay;
 
         public StableProgress() {
         }
@@ -122,7 +121,7 @@ public class ProgressCheckpoint {
             return schemaDone;
         }
 
-        public void setSchemaDone(boolean schemaDone) {
+        public synchronized void setSchemaDone(boolean schemaDone) {
             this.schemaDone = schemaDone;
         }
 
@@ -131,14 +130,17 @@ public class ProgressCheckpoint {
         }
 
         public void setCompletedFiles(Map<String, Long> completedFiles) {
-            this.completedFiles = completedFiles;
+            this.completedFiles.clear();
+            if (completedFiles != null) {
+                this.completedFiles.putAll(completedFiles);
+            }
         }
 
         public String getCurrentFile() {
             return currentFile;
         }
 
-        public void setCurrentFile(String currentFile) {
+        public synchronized void setCurrentFile(String currentFile) {
             this.currentFile = currentFile;
         }
 
@@ -146,7 +148,7 @@ public class ProgressCheckpoint {
             return currentFileOffset;
         }
 
-        public void setCurrentFileOffset(long currentFileOffset) {
+        public synchronized void setCurrentFileOffset(long currentFileOffset) {
             this.currentFileOffset = currentFileOffset;
         }
 
@@ -154,19 +156,27 @@ public class ProgressCheckpoint {
             return totalRecords;
         }
 
-        public void setTotalRecords(long totalRecords) {
+        public synchronized void setTotalRecords(long totalRecords) {
             this.totalRecords = totalRecords;
+        }
+
+        /**
+         * Atomically add delta to totalRecords. Thread-safe for concurrent partition calls.
+         */
+        public synchronized long addTotalRecords(long delta) {
+            this.totalRecords += delta;
+            return this.totalRecords;
         }
 
         public String getLastExportTs() {
             return lastExportTs;
         }
 
-        public void setLastExportTs(String lastExportTs) {
+        public synchronized void setLastExportTs(String lastExportTs) {
             this.lastExportTs = lastExportTs;
         }
 
-        public void markFileCompleted(String fileName, long recordCount) {
+        public synchronized void markFileCompleted(String fileName, long recordCount) {
             completedFiles.put(fileName, recordCount);
             currentFile = null;
             currentFileOffset = 0;
@@ -181,14 +191,17 @@ public class ProgressCheckpoint {
         }
 
         public void setCompletedDays(Set<String> completedDays) {
-            this.completedDays = completedDays;
+            this.completedDays.clear();
+            if (completedDays != null) {
+                this.completedDays.addAll(completedDays);
+            }
         }
 
         public String getCurrentDay() {
             return currentDay;
         }
 
-        public void setCurrentDay(String currentDay) {
+        public synchronized void setCurrentDay(String currentDay) {
             this.currentDay = currentDay;
         }
 
@@ -196,10 +209,7 @@ public class ProgressCheckpoint {
             return completedDays != null && completedDays.contains(dateStr);
         }
 
-        public void markDayCompleted(String dateStr) {
-            if (completedDays == null) {
-                completedDays = new LinkedHashSet<>();
-            }
+        public synchronized void markDayCompleted(String dateStr) {
             completedDays.add(dateStr);
             if (dateStr.equals(currentDay)) {
                 currentDay = null;

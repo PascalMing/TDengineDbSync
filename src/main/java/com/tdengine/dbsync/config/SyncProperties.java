@@ -50,6 +50,8 @@ public class SyncProperties {
     private String startTime;
     /** Export end time (exclusive). Format: "yyyy-MM-dd" or "yyyy-MM-dd HH:mm:ss". Blank=auto-detect. */
     private String endTime;
+    /** Export file rotation size in MB, default 100. */
+    private int fileSizeMb = 100;
     private int blockSize = 100000;
     private Compression compression = Compression.GZIP;
     /** Data file format: CSV (fast) or JSON (compatible) */
@@ -62,6 +64,10 @@ public class SyncProperties {
     private int pipelineQueueSize = 10;
     /** Connection pool size (0 disables pooling, default 50) */
     private int connectionPoolSize = 50;
+    /** Page size for LIMIT/OFFSET pagination in export, default 5000. Larger = fewer HTTP requests but more memory per page. */
+    private int pageSize = 5000;
+    /** Time window (minutes) per export partition, default 5. Smaller = more parallelism but more files. */
+    private int partitionWindowMinutes = 5;
 
     public ConnectionMode getConnectionMode() {
         return connectionMode;
@@ -217,6 +223,14 @@ public class SyncProperties {
         this.endTime = endTime;
     }
 
+    public int getFileSizeMb() {
+        return fileSizeMb;
+    }
+
+    public void setFileSizeMb(int fileSizeMb) {
+        this.fileSizeMb = fileSizeMb;
+    }
+
     public int getBlockSize() {
         return blockSize;
     }
@@ -273,6 +287,22 @@ public class SyncProperties {
         this.connectionPoolSize = connectionPoolSize;
     }
 
+    public int getPageSize() {
+        return pageSize;
+    }
+
+    public void setPageSize(int pageSize) {
+        this.pageSize = pageSize;
+    }
+
+    public int getPartitionWindowMinutes() {
+        return partitionWindowMinutes;
+    }
+
+    public void setPartitionWindowMinutes(int partitionWindowMinutes) {
+        this.partitionWindowMinutes = partitionWindowMinutes;
+    }
+
     public static class JdbcConfig {
         private String driverClassName = "com.taosdata.jdbc.TSDBDriver";
         private String url = "jdbc:TAOS://localhost:6030";
@@ -316,6 +346,9 @@ public class SyncProperties {
         private String url = "http://localhost:6041";
         private String username = "root";
         private String password = "taosdata";
+        private int connectTimeout = 300000;
+        private int socketTimeout = 300000;
+        private int requestTimeout = 300000;
 
         public String getUrl() {
             return url;
@@ -339,6 +372,30 @@ public class SyncProperties {
 
         public void setPassword(String password) {
             this.password = password;
+        }
+
+        public int getConnectTimeout() {
+            return connectTimeout;
+        }
+
+        public void setConnectTimeout(int connectTimeout) {
+            this.connectTimeout = connectTimeout;
+        }
+
+        public int getSocketTimeout() {
+            return socketTimeout;
+        }
+
+        public void setSocketTimeout(int socketTimeout) {
+            this.socketTimeout = socketTimeout;
+        }
+
+        public int getRequestTimeout() {
+            return requestTimeout;
+        }
+
+        public void setRequestTimeout(int requestTimeout) {
+            this.requestTimeout = requestTimeout;
         }
     }
 }

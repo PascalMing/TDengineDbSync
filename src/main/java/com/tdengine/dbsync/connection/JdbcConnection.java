@@ -114,7 +114,9 @@ public class JdbcConnection implements TdConnection {
     public ResultSet queryDirect(String sql) {
         try {
             Statement stmt = getConnection().createStatement(ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY);
-            stmt.setFetchSize(10000);
+            // Use a smaller fetch size to enable streaming mode, preventing OOM
+            // when querying large result sets.
+            stmt.setFetchSize(2000);
             return stmt.executeQuery(sql);
         } catch (SQLException e) {
             throw new RuntimeException("Direct query failed: " + sql + " - " + e.getMessage(), e);

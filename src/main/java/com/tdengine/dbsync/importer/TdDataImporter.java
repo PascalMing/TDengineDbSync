@@ -260,7 +260,7 @@ public class TdDataImporter implements DataImporter {
         for (String stableName : schemaFile.getSuperTables().keySet()) {
             try {
                 List<String> childTables = new ArrayList<>();
-                conn.query("SELECT TBNAME FROM " + database + "." + stableName + " GROUP BY TBNAME", rs -> {
+                conn.query("SHOW TABLE TAGS FROM " + database + "." + stableName, rs -> {
                     while (rs.next()) {
                         String tbname = rs.getString(1);
                         if (tbname != null) {
@@ -282,7 +282,7 @@ public class TdDataImporter implements DataImporter {
     }
 
     private void loadAndReconcileChildTables(String sourceDb, String targetDb, SchemaFile schemaFile, TdConnection conn) {
-        Path manifestDir = Path.of(properties.getDataDir(), sourceDb, "childtables");
+        Path manifestDir = Path.of(properties.getDataDir(), sourceDb, "structure");
 
         for (Map.Entry<String, SuperTableMeta> entry : schemaFile.getSuperTables().entrySet()) {
             String stableName = entry.getKey();
@@ -309,8 +309,7 @@ public class TdDataImporter implements DataImporter {
     private Set<String> queryExistingChildTables(String database, String stableName, TdConnection conn) {
         Set<String> names = new LinkedHashSet<>();
         try {
-            conn.query("SELECT table_name FROM information_schema.ins_child_tables " +
-                    "WHERE db_name = '" + database + "' AND stable_name = '" + stableName + "'", rs -> {
+            conn.query("SHOW TABLE TAGS FROM " + database + "." + stableName, rs -> {
                 while (rs.next()) {
                     String tbname = rs.getString(1);
                     if (tbname != null && !tbname.isBlank()) {
@@ -319,7 +318,7 @@ public class TdDataImporter implements DataImporter {
                 }
             });
         } catch (Exception e) {
-            log.warn("  information_schema query failed for existing child tables of {}: {}", stableName, e.getMessage());
+            log.warn("  SHOW TABLE TAGS FROM failed for existing child tables of {}: {}", stableName, e.getMessage());
         }
 
         if (names.isEmpty()) {
@@ -945,7 +944,49 @@ public class TdDataImporter implements DataImporter {
         List<Path> files = new ArrayList<>();
         String prefix = stableName + "_";
 
-        // 1. Scan date subdirectories (new format: {yyyyMMdd}/)
+        // 1. Scan date/slice_* partition subdirectories (new time-window format)
+        //    Path: {dataDir}/{stableName}/{yyyyMMdd}/slice_{HHmmss}_{index}/*.gz
+        Path stableDir = dataDir.resolve(stableName);
+        if (Files.isDirectory(stableDir)) {
+            List<Path> dateDirs = new ArrayList<>();
+            try (DirectoryStream<Path> stream = Files.newDirectoryStream(stableDir, entry ->
+                    Files.isDirectory(entry) && entry.getFileName().toString().matches("\\d{8}"))) {
+                for (Path entry : stream) {
+                    dateDirs.add(entry);
+                }
+            }
+            dateDirs.sort(Comparator.comparing(p -> p.getFileName().toString()));
+
+            for (Path dateDir : dateDirs) {
+                List<Path> sliceDirs = new ArrayList<>();
+                try (DirectoryStream<Path> stream = Files.newDirectoryStream(dateDir, entry ->
+                        Files.isDirectory(entry) && entry.getFileName().toString().startsWith("slice_"))) {
+                    for (Path entry : stream) {
+                        sliceDirs.add(entry);
+                    }
+                }
+                sliceDirs.sort(Comparator.comparing(p -> p.getFileName().toString()));
+
+                for (Path sliceDir : sliceDirs) {
+                    try (DirectoryStream<Path> sliceStream = Files.newDirectoryStream(sliceDir, "*.gz")) {
+                        List<Path> sliceFiles = new ArrayList<>();
+                        for (Path entry : sliceStream) {
+                            String fileName = entry.getFileName().toString();
+                            if (fileName.startsWith(prefix)) {
+                                sliceFiles.add(entry);
+                            }
+                        }
+                        sliceFiles.sort(Comparator.comparing(p -> p.getFileName().toString()));
+                        files.addAll(sliceFiles);
+                    }
+                }
+            }
+            if (!files.isEmpty()) {
+                log.info("  Found {} file(s) in partition subdirectories for {}", files.size(), stableName);
+            }
+        }
+
+        // 2. Scan date subdirectories (backward compat: {yyyyMMdd}/)
         List<Path> dateDirs = new ArrayList<>();
         try (DirectoryStream<Path> stream = Files.newDirectoryStream(dataDir)) {
             for (Path entry : stream) {
@@ -957,7 +998,6 @@ public class TdDataImporter implements DataImporter {
                 }
             }
         }
-        // Sort date directories chronologically
         dateDirs.sort(Comparator.comparing(p -> p.getFileName().toString()));
 
         for (Path dateDir : dateDirs) {
@@ -974,7 +1014,7 @@ public class TdDataImporter implements DataImporter {
             }
         }
 
-        // 2. Also scan flat directory (backward compat with old format)
+        // 3. Also scan flat directory (backward compat with old format)
         try (DirectoryStream<Path> stream = Files.newDirectoryStream(dataDir, "*.gz")) {
             List<Path> flatFiles = new ArrayList<>();
             for (Path entry : stream) {

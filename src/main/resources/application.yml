@@ -14,6 +14,10 @@ tdengine:
     #url: http://192.168.3.145:6041
     username: root
     password: taosdata
+    # REST/JDBC timeouts in milliseconds (default 300000 = 300s)
+    connect-timeout: 300000
+    socket-timeout: 300000
+    request-timeout: 300000
   # Run mode: export / import
   mode: import
   # Data directory for export/import files
@@ -36,9 +40,11 @@ tdengine:
   export-order-by-ts: false
   # Per-super-table additional non-time conditions (appended with AND to common conditions)
   stable-conditions: {}
-  #  stable_history_data: "device_id = '023109006'"
+    # stable_history_data: "thing_id = '023109006'"
     # st1: "v1 > 100"
     # st2: "status = 'active'"
+  # Export file rotation size in MB (default 100)
+  file-size-mb: 100
   # Records per compressed block file
   block-size: 100000
   # Compression format: gzip
@@ -53,3 +59,9 @@ tdengine:
   pipeline-queue-size: 50
   # Connection pool size (0 disables pooling, default 50)
   connection-pool-size: 60
+  # Page size for LIMIT/OFFSET pagination in export (default 5000).
+  # Larger = fewer HTTP requests but more memory per page.
+  page-size: 5000
+  # Time window (minutes) per export partition (default 5).
+  # Smaller = more parallelism but more files.
+  partition-window-minutes: 5

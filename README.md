@@ -22,7 +22,7 @@ TDengine 3.0+ 数据库数据导出与导入工具，基于 Java 21 + Spring Boo
 ## 功能特性
 
 - **双连接模式**: 支持 JDBC 原生连接和 REST API 连接
-- **并行导出**: 多超级表并行导出 + 单超级表固定分片并行，线程数可配置（默认30）
+- **并行导出**: 多超级表按时间区间并行导出，线程数可配置（默认30）
 - **CSV/JSON双格式**: CSV 格式高性能，JSON 格式兼容性好
 - **数据压缩**: Gzip 压缩，按块大小（默认10W条）分文件
 - **组合查询条件**: 结构化时间范围(start-time/end-time) + 通用非时间条件 + 超级表级别附加条件
@@ -32,7 +32,7 @@ TDengine 3.0+ 数据库数据导出与导入工具，基于 Java 21 + Spring Boo
 - **高效导入**: 多消费者并行写入、生产者-消费者流水线、子表先创建后仅插入、多表合并INSERT、**多超级表并行导入**
 - **连接池**: 基于Semaphore的连接池，限制最大并发连接数，避免连接泄露
 - **子表名保持**: CSV 含 `tbname` 列，导入时直接使用原始子表名（REST API模式也支持）
-- **子表清单**: 导出时自动生成流式子表清单，导入时按目标库现状差集补建并重置 tag
+- **子表清单**: 先导出一次结构集，记录子表名和 tag；导入时先执行结构集，再导数据
 - **导出/导入库分离**: 支持导出库与导入库不同名，通过 `target-database` 配置
 - **进度日志**: 每10秒输出一次进度，启动时打印断点摘要，优雅退出时保存断点
 
@@ -105,6 +105,9 @@ tdengine:
     url: http://localhost:6041
     username: root
     password: taosdata
+    connect-timeout: 300000   # REST 连接建立超时，单位 ms
+    socket-timeout: 300000    # REST 读超时，单位 ms
+    request-timeout: 300000   # 服务端响应等待超时，单位 ms
 
   # 运行模式: export(导出) / import(导入)
   mode: export
@@ -140,8 +143,8 @@ tdengine:
     st1: "v1 > 100"
     st2: "status = 'active'"
 
-  # 每个压缩文件的记录数
-  block-size: 100000
+  # 每个导出文件大小，单位 MB
+  file-size-mb: 100
 
   # 压缩格式
   compression: gzip
@@ -177,15 +180,19 @@ tdengine:
 | `export-conditions` | String | `""` | 通用非时间WHERE条件，应用于所有超级表 |
 | `export-order-by-ts` | boolean | `false` | 导出 SQL 是否按时间升序排序；默认关闭以提升吞吐 |
 | `stable-conditions` | Map | `{}` | 每个超级表的附加WHERE条件，与通用条件AND合并 |
-| `block-size` | int | `100000` | 每个压缩块文件的记录数 |
+| `file-size-mb` | int | `100` | 每个导出文件大小，单位 MB |
 | `compression` | Enum | `gzip` | 压缩格式 |
 | `format` | Enum | `csv` | 数据格式，`csv`性能最优，`json`兼容性好 |
 | `parallel` | int | `30` | 并行线程数，导出时按超级表或子表固定分片并行，导入时多消费者+多超级表并行 |
 | `batch-size` | int | `5000` | 导入批量INSERT大小。REST API模式下建议5000+以减少HTTP往返次数 |
 | `pipeline-queue-size` | int | `10` | 导入流水线队列深度 |
 | `connection-pool-size` | int | `50` | 连接池最大连接数，0禁用连接池 |
+| `restful.connect-timeout` | int | `300000` | REST 连接建立超时，单位毫秒 |
+| `restful.socket-timeout` | int | `300000` | REST 读超时，单位毫秒 |
+| `restful.request-timeout` | int | `300000` | REST 请求等待超时，单位毫秒 |
 
 说明: `export-order-by-ts=false` 是默认值，面向大规模导出时优先保证吞吐；如需严格时间有序输出，再显式开启。
+导出文件切分按 `file-size-mb` 控制，不再按子表拆文件。
 
 ---
 
@@ -284,8 +291,8 @@ SyncRunner (CommandLineRunner)
               ┌────────────────────────▼────────────────────┐
               │ 1. 元数据连接 → 查询超级表列表、导出Schema   │
               │    输出: {database}_schema.json              │
-              │ 2. 导出子表清单                               │
-              │    输出: childtables/{stable}.jsonl.gz       │
+               │ 2. 导出子表结构集                             │
+               │    输出: structure/{stable}.jsonl.gz         │
               └────────────────────────┬────────────────────┘
                                        │
               ┌────────────────────────▼────────────────────┐
@@ -293,7 +300,7 @@ SyncRunner (CommandLineRunner)
               │    - 配置了start-time/end-time → 使用配置值   │
               │    - 未配置 → 自动查询MIN(ts)/MAX(ts)         │
               │ 3. 生成日期列表 [day1, day2, ...]             │
-              │ 4. 构建分片列表 (超级表/子表批次)              │
+               │ 4. 构建时间窗口任务                             │
               └────────────────────────┬────────────────────┘
                                        │
            ┌───────────────────────────▼───────────────────────────┐
@@ -303,33 +310,31 @@ SyncRunner (CommandLineRunner)
            │    跳过已完成的天 (completedDays)                       │
            │    当天所有分区并行执行:                                 │
            │                                                        │
-           │    构建 SQL:                                           │
-            │    SELECT tbname, * FROM db.stable                    │
-           │    WHERE ts >= '{dayStart}' AND ts < '{dayEnd}'       │
-           │      [AND ts > {lastExportTs}]  ← 天内断点恢复        │
-           │      [AND {userConditions}]                            │
-            │      [AND tbname IN (...)]     ← 分片模式             │
-           │    ORDER BY ts ASC                                     │
+            │    构建 SQL:                                           │
+            │    SELECT tbname, data_cols... FROM db.stable         │
+            │    WHERE ts >= '{dayStart}' AND ts < '{dayEnd}'       │
+            │      [AND ts > {lastExportTs}]  ← 天内断点恢复        │
+            │      [AND {userConditions}]                            │
+            │    ORDER BY ts ASC                                     │
            │                     │                                  │
            │          ┌─────────▼──────────┐                        │
            │          │  流式读取 ResultSet  │                        │
            │          └─────────┬──────────┘                        │
            │                    │                                   │
            │     ┌──────────────▼──────────────┐                    │
-           │     │  每10W条 → 创建新 .gz 文件    │                    │
-           │     │  目录: {yyyyMMdd}/           │                    │
-           │     │  整表: {stable}_{HHmmssSSS}  │                    │
-            │     │  分片: {stable}_P{idx}_...    │                    │
-           │     └──────────────┬──────────────┘                    │
+            │     │  达到 file-size-mb → 创建新 .gz 文件 │              │
+            │     │  目录: data/{db}/structure, data/{db}/   │          │
+            │     │  文件: {stable}_{HHmmssSSS}.gz           │          │
+            │     └──────────────┬──────────────┘                    │
            │                    │                                   │
            │     ┌──────────────▼──────────────┐                    │
-           │     │  写入 CSV (Tab分隔) 或 JSON   │                    │
-           │     │  tag列加 "tag_" 前缀标识      │                    │
-           │     └──────────────┬──────────────┘                    │
+            │     │  写入 CSV (Tab分隔) 或 JSON   │                    │
+            │     │  仅包含 tbname + 数据列       │                    │
+            │     └──────────────┬──────────────┘                    │
            │                    │                                   │
            │     ┌──────────────▼──────────────┐                    │
-           │     │  天完成 → markDayCompleted    │                    │
-           │     │  定期更新断点 (每30秒)         │                    │
+            │     │  天完成 → markDayCompleted    │                    │
+            │     │  定期更新断点 (每30秒)         │                    │
            │     └─────────────────────────────┘                    │
            └────────────────────────────────────────────────────────┘
                                        │
@@ -442,7 +447,7 @@ JDBC 原生连接始终使用 `SHOW STABLES`，不受此问题影响。
 
 ```
 导入3个文件, 在第2个文件第3000行时中断:
-  - st1_20240101.gz: ✓ 已完成 (100000条)
+  - st1_20240101.gz: ✓ 已完成 (按文件大小轮转)
   - st1_20240102.gz: ⚠ 进行中 (已完成3000行)
   - st1_20240103.gz: ✗ 未开始
 
@@ -532,26 +537,26 @@ Thread-30: st30 ──── JDBC Connection 30 ───→ st30_*.gz
 每个线程独立连接, 互不阻塞
 ```
 
-**场景2: 单超级表 + 大量子表 → 固定分片并行**
+**场景2: 单超级表 + 大量子表 → 时间窗口并行**
 
-当单超级表子表数很大时，按固定数量的 shard writer 并发写盘：
+当单超级表子表数很大时，按时间窗口并发导出：
 
-shard 数通常设置为 `parallel * 4` 上限，再由线程池调度执行。这样可以让查询结果只扫描一次，然后在客户端按 `tbname hash` 分流到多个 shard 文件，同时保留连接池和 CPU 的可控并发。
+每个任务只扫描一次超级表，结果直接顺序写入单个输出流，达到 `file-size-mb` 后轮转。这样不会因为子表太多生成大量碎文件。
 
 ```
 1个超级表 st1, 100000个子表, parallel=30:
 
-1. 只查询一次: SELECT tbname, * FROM db.st1 ... ORDER BY ts ASC
-2. 客户端按 tbname hash 分成 120 个 shard writer
-3. 每个 shard 独立写自己的 .gz 文件, 按 128MB 左右轮转
+1. 只查询一次: SELECT tbname, data_cols... FROM db.st1 ... ORDER BY ts ASC
+2. 顺序写入单个输出流
+3. 文件达到 100MB 后轮转生成下一个文件
 
 Reader thread:  单次 ResultSet 扫描
-    ├── hash(t1) → shard 0 → st1_P0_*.gz
-    ├── hash(t2) → shard 17 → st1_P17_*.gz
-    └── hash(t3) → shard 83 → st1_P83_*.gz
+    ├── t1 → st1_*.gz
+    ├── t2 → st1_*.gz
+    └── t3 → st1_*.gz
 
-分片文件名: {stable}_P{partitionIndex}_{timestamp}.gz
-文件在达到约 `128MB` 后自动轮转生成下一个 shard 块。
+文件名: {stable}_{timestamp}.gz
+文件在达到 `file-size-mb` 后自动轮转生成下一个文件。
 ```
 
 ### 导入流水线详解
@@ -598,6 +603,17 @@ POISON信号: 生产者结束时向每个消费者发送终止信号
     - currentFileChildTable: 单子表模式下的子表名
   
   PipelineCtx 非线程安全, 但通过 BlockingQueue 的 happens-before 保证可见性
+
+结构集与数据集分离:
+  1. 先执行一次结构集查询，拿到 tbname + tag values
+  2. 再执行数据查询，仅选择 tbname + 超级表数据列
+  3. 导入时先落结构集，再并行导数据
+
+导出文件切分:
+  - 文件大小可配置，单位 MB，默认 100MB
+  - 按超级表 + 时间戳命名
+  - 同一文件内可混合多个子表的数据
+  - 只按文件体积轮转，不按子表拆文件
 ```
 
 ### 连接池设计详解
@@ -746,7 +762,7 @@ tdengine:
   end-time: "2025-01-01"
   format: csv
   parallel: 30
-  block-size: 100000
+  file-size-mb: 100
 ```
 
 导出时会自动按天拆分，数据文件存入 `{yyyyMMdd}/` 日期子目录。
@@ -823,6 +839,7 @@ java -jar dbsync-1.0.0.jar --tdengine.mode=export --tdengine.database=iot_db
 # Resuming from previous checkpoint...
 #   [st1] completedFiles=..., currentFile=..., currentFileOffset=...
 #   [st1] Resumed file ... from line ...
+#   REST connect timeout: 300000 ms
 ```
 
 ### 示例7: 使用REST API连接 (无需安装TDengine客户端)

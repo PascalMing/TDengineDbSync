@@ -7,6 +7,7 @@ import org.slf4j.LoggerFactory;
 
 import java.sql.*;
 import java.util.ArrayList;
+import java.util.Properties;
 import java.util.List;
 
 /**
@@ -39,11 +40,13 @@ public class RestApiConnection implements TdConnection {
                 url = url.substring(0, url.length() - 1);
             }
             log.debug("Establishing REST API connection: {}", url);
-            connection = DriverManager.getConnection(
-                    url,
-                    config.getUsername(),
-                    config.getPassword()
-            );
+            Properties props = new Properties();
+            props.setProperty("user", config.getUsername());
+            props.setProperty("password", config.getPassword());
+            props.setProperty("httpConnectTimeout", String.valueOf(config.getConnectTimeout()));
+            props.setProperty("httpSocketTimeout", String.valueOf(config.getSocketTimeout()));
+            props.setProperty("messageWaitTimeout", String.valueOf(config.getRequestTimeout()));
+            connection = DriverManager.getConnection(url, props);
         }
         return connection;
     }
@@ -146,7 +149,9 @@ public class RestApiConnection implements TdConnection {
     public ResultSet queryDirect(String sql) {
         try {
             Statement stmt = getConnection().createStatement(ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY);
-            stmt.setFetchSize(10000);
+            // Use a smaller fetch size to enable streaming mode, preventing OOM
+            // when querying large result sets via the REST API.
+            stmt.setFetchSize(2000);
             return stmt.executeQuery(sql);
         } catch (SQLException e) {
             throw new RuntimeException("Direct query failed: " + sql + " - " + e.getMessage(), e);
