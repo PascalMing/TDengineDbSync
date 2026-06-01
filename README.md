@@ -22,12 +22,13 @@ TDengine 3.0+ 数据库数据导出与导入工具，基于 Java 21 + Spring Boo
 ## 功能特性
 
 - **双连接模式**: 支持 JDBC 原生连接和 REST API 连接
-- **并行导出**: 多超级表按时间区间并行导出，线程数可配置（默认30）
+- **并行导出**: 时间窗口分区并行导出，按可配置的时间窗口（默认5分钟）将时间范围切片，所有分区提交到线程池并行执行，线程数可配置
 - **CSV/JSON双格式**: CSV 格式高性能，JSON 格式兼容性好
-- **数据压缩**: Gzip 压缩，按块大小（默认10W条）分文件
+- **数据压缩**: Gzip 压缩，按文件大小（默认100MB）分文件
 - **组合查询条件**: 结构化时间范围(start-time/end-time) + 通用非时间条件 + 超级表级别附加条件
-- **按天拆分**: 导出自动按天迭代，每天独立子目录 `{yyyyMMdd}/`，数据文件按天组织
-- **断点恢复**: 天级+时间戳双重导出恢复 + 基于文件/已提交行偏移的导入恢复
+- **分区目录组织**: 导出按 `{stableName}/{yyyyMMdd}/slice_{HHmmss}_{idx}/` 分目录存储，每个分区独立子目录
+- **LIMIT/OFFSET 分页**: 每页通过 SQL 级 LIMIT/OFFSET 拉取，避免 REST API 内存溢出（OOM）
+- **断点恢复**: 基于已完成文件的导入/导出恢复，支持中断后跳过已完成分区
 - **Schema一致性校验**: 导入时比对超级表DDL，不一致终止并提示
 - **高效导入**: 多消费者并行写入、生产者-消费者流水线、子表先创建后仅插入、多表合并INSERT、**多超级表并行导入**
 - **连接池**: 基于Semaphore的连接池，限制最大并发连接数，避免连接泄露
@@ -152,7 +153,7 @@ tdengine:
   # 数据文件格式: csv(高性能) / json(兼容)
   format: csv
 
-  # 并行线程数(导出: 按超级表/子表固定分片并行; 导入: 多超级表并行+多消费者写入)
+  # 并行线程数(导出: 按时间窗口分区并行; 导入: 多超级表并行+多消费者写入)
   parallel: 30
 
   # 导入批量写入大小
@@ -163,6 +164,12 @@ tdengine:
 
   # 连接池大小(0禁用连接池)
   connection-pool-size: 50
+
+  # LIMIT/OFFSET 分页大小(导出)，越大单页数据越多但内存消耗越大
+  page-size: 5000
+
+  # 时间窗口大小(分钟)，每个窗口为独立导出分区，越小并行度越高但文件越多
+  partition-window-minutes: 5
 ```
 
 ### 配置项说明
@@ -183,16 +190,19 @@ tdengine:
 | `file-size-mb` | int | `100` | 每个导出文件大小，单位 MB |
 | `compression` | Enum | `gzip` | 压缩格式 |
 | `format` | Enum | `csv` | 数据格式，`csv`性能最优，`json`兼容性好 |
-| `parallel` | int | `30` | 并行线程数，导出时按超级表或子表固定分片并行，导入时多消费者+多超级表并行 |
+| `parallel` | int | `30` | 并行线程数，导出时按时间窗口分区并行，导入时多消费者+多超级表并行 |
 | `batch-size` | int | `5000` | 导入批量INSERT大小。REST API模式下建议5000+以减少HTTP往返次数 |
 | `pipeline-queue-size` | int | `10` | 导入流水线队列深度 |
 | `connection-pool-size` | int | `50` | 连接池最大连接数，0禁用连接池 |
+| `page-size` | int | `5000` | LIMIT/OFFSET 分页大小，越大单页数据越多但内存消耗越大 |
+| `partition-window-minutes` | int | `5` | 时间窗口大小(分钟)，每个窗口为一个独立导出分区，越小并行度越高 |
 | `restful.connect-timeout` | int | `300000` | REST 连接建立超时，单位毫秒 |
 | `restful.socket-timeout` | int | `300000` | REST 读超时，单位毫秒 |
 | `restful.request-timeout` | int | `300000` | REST 请求等待超时，单位毫秒 |
 
 说明: `export-order-by-ts=false` 是默认值，面向大规模导出时优先保证吞吐；如需严格时间有序输出，再显式开启。
-导出文件切分按 `file-size-mb` 控制，不再按子表拆文件。
+导出时间范围自动按 `partition-window-minutes` 划分为 N 分钟的时间窗口，每个窗口为一个独立分区并行导出，
+写入各自独立的 `slice_{HHmmss}_{idx}/` 子目录。文件切分按 `file-size-mb` 控制。
 
 ---
 
@@ -208,7 +218,7 @@ TDengineDbSync/
 └── src/main/java/com/tdengine/dbsync/
     ├── DbSyncApplication.java              # SpringBoot 启动类
     ├── config/
-    │   └── SyncProperties.java             # 配置属性映射 (15个配置项, 4个枚举)
+    │   └── SyncProperties.java             # 配置属性映射 (17个配置项, 4个枚举)
     ├── connection/
     │   ├── TdConnection.java               # 连接抽象接口 (Strategy模式)
     │   ├── JdbcConnection.java             # JDBC原生连接实现
@@ -275,74 +285,161 @@ SyncRunner (CommandLineRunner)
 ### 导出数据流
 
 ```
+
                         ┌──────────────────────────────┐
+
                         │      SyncService.execute()    │
+
                         └──────────────┬───────────────┘
+
                                        │
+
                         ┌──────────────▼───────────────┐
+
                         │    CheckpointManager.init()   │
+
                         │  (加载或创建进度断点文件)       │
+
                         └──────────────┬───────────────┘
+
                                        │
+
                    ┌───────────────────▼───────────────────┐
+
                    │        TdDataExporter.exportData()     │
+
                    └───────────────────┬───────────────────┘
+
                                        │
+
               ┌────────────────────────▼────────────────────┐
+
               │ 1. 元数据连接 → 查询超级表列表、导出Schema   │
+
               │    输出: {database}_schema.json              │
-               │ 2. 导出子表结构集                             │
-               │    输出: structure/{stable}.jsonl.gz         │
+
+              │ 2. 导出子表结构集                             │
+
+              │    输出: structure/{stable}.jsonl.gz         │
+
               └────────────────────────┬────────────────────┘
+
                                        │
+
               ┌────────────────────────▼────────────────────┐
-              │ 2. 确定时间范围                                │
+
+              │ 3. 确定时间范围                                │
+
               │    - 配置了start-time/end-time → 使用配置值   │
+
               │    - 未配置 → 自动查询MIN(ts)/MAX(ts)         │
-              │ 3. 生成日期列表 [day1, day2, ...]             │
-               │ 4. 构建时间窗口任务                             │
+
+              │ 4. 构建时间窗口分区列表                        │
+
+              │    - 按 partitionWindowMinutes 切分时间范围    │
+
+              │    - 每个窗口: {stableName}/{yyyyMMdd}/       │
+
+              │      slice_{HHmmss}_{idx}/                    │
+
               └────────────────────────┬────────────────────┘
+
                                        │
+
            ┌───────────────────────────▼───────────────────────────┐
-           │         按天迭代导出 (天为外层循环)                      │
+
+           │   并行提交所有分区到线程池 (ExecutorService)             │
+
            │                                                        │
-           │  for each day:                                         │
-           │    跳过已完成的天 (completedDays)                       │
-           │    当天所有分区并行执行:                                 │
-           │                                                        │
-            │    构建 SQL:                                           │
-            │    SELECT tbname, data_cols... FROM db.stable         │
-            │    WHERE ts >= '{dayStart}' AND ts < '{dayEnd}'       │
-            │      [AND ts > {lastExportTs}]  ← 天内断点恢复        │
-            │      [AND {userConditions}]                            │
-            │    ORDER BY ts ASC                                     │
-           │                     │                                  │
-           │          ┌─────────▼──────────┐                        │
-           │          │  流式读取 ResultSet  │                        │
-           │          └─────────┬──────────┘                        │
-           │                    │                                   │
-           │     ┌──────────────▼──────────────┐                    │
-            │     │  达到 file-size-mb → 创建新 .gz 文件 │              │
-            │     │  目录: data/{db}/structure, data/{db}/   │          │
-            │     │  文件: {stable}_{HHmmssSSS}.gz           │          │
-            │     └──────────────┬──────────────┘                    │
-           │                    │                                   │
-           │     ┌──────────────▼──────────────┐                    │
-            │     │  写入 CSV (Tab分隔) 或 JSON   │                    │
-            │     │  仅包含 tbname + 数据列       │                    │
-            │     └──────────────┬──────────────┘                    │
-           │                    │                                   │
-           │     ┌──────────────▼──────────────┐                    │
-            │     │  天完成 → markDayCompleted    │                    │
-            │     │  定期更新断点 (每30秒)         │                    │
-           │     └─────────────────────────────┘                    │
-           └────────────────────────────────────────────────────────┘
+
+           │   ┌───────┐ ┌───────┐ ┌───────┐      ┌───────┐       │
+
+           │   │Part-0 │ │Part-1 │ │Part-2 │ ...  │Part-N │       │
+
+           │   │st1    │ │st1    │ │st2    │      │st2    │       │
+
+           │   │00:00~ │ │05:00~ │ │00:00~ │      │10:00~ │       │
+
+           │   │05:00  │ │10:00  │ │05:00  │      │15:00  │       │
+
+           │   └─┬─────┘ └─┬─────┘ └─┬─────┘      └─┬─────┘       │
+
+           │     │ 独立连接  │ 独立连接  │ 独立连接     │ 独立连接     │
+
+           └─────┼──────────┼──────────┼──────────────┼───────────┘
+
+                 │          │          │              │
+
+         ┌───────▼──┐ ┌────▼───┐ ┌────▼───┐      ┌───▼───────┐
+
+         │ 构建SQL:  │ │构建SQL:│ │构建SQL: │      │ 构建SQL:   │
+
+         │ SELECT   │ │SELECT  │ │SELECT  │      │ SELECT    │
+
+         │ tbname,* │ │...     │ │...     │      │ ...       │
+
+         │ FROM db  │ │        │ │        │      │           │
+
+         │ .stable  │ │        │ │        │      │           │
+
+         │ WHERE ts │ │        │ │        │      │           │
+
+         │>= wStart │ │        │ │        │      │           │
+
+         │AND ts<   │ │        │ │        │      │           │
+
+         │ wEnd     │ │        │ │        │      │           │
+
+         │[AND user │ │        │ │        │      │           │
+
+         │ cond.]   │ │        │ │        │      │           │
+
+         └────┬─────┘ └───┬────┘ └───┬────┘      └───┬───────┘
+
+              │           │          │               │
+
+         ┌────▼────┐ ┌───▼────┐ ┌───▼────┐      ┌────▼────┐
+
+         │LIMIT/   │ │LIMIT/  │ │LIMIT/  │      │LIMIT/   │
+
+         │OFFSET   │ │OFFSET  │ │OFFSET  │      │OFFSET   │
+
+         │分页拉取  │ │分页拉取 │ │分页拉取 │      │分页拉取  │
+
+         └────┬────┘ └───┬────┘ └───┬────┘      └───┬─────┘
+
+              │           │          │               │
+
+         ┌────▼──────────▼──┐  ┌────▼───────────────▼──┐
+
+         │ 按 file-size-mb  │  │ 按 file-size-mb       │
+
+         │ 轮转, 写入 .gz    │  │ 轮转, 写入 .gz       │
+
+         │ 输出目录:         │  │ 输出目录:             │
+
+         │ {stableName}/    │  │ {stableName}/        │
+
+         │  {yyyyMMdd}/     │  │  {yyyyMMdd}/         │
+
+         │  slice_*/        │  │  slice_*/            │
+
+         │  {stable}_*.gz   │  │  {stable}_*.gz       │
+
+         └──────────────────┘  └──────────────────────┘
+
                                        │
+
                         ┌──────────────▼───────────────┐
-                        │   全部完成 → 删除断点文件       │
-                        │   异常退出 → 保留断点可恢复     │
+
+                        │ 全部完成 → 删除断点文件        │
+
+                        │ 异常退出 → 保留断点可恢复      │
+
                         └──────────────────────────────┘
+
 ```
+
 
 ### 导入数据流
 
@@ -421,27 +518,48 @@ JDBC 原生连接始终使用 `SHOW STABLES`，不受此问题影响。
 
 断点恢复是本工具的核心特性之一，确保大数据量场景下的可靠性。
 
-### 导出断点: 天级 + 时间戳双重恢复
+### 导出断点: 基于已完成分区文件
 
-**天级恢复**: 断点记录 `completedDays` 集合，已完成的天整体跳过，无需重新查询。
+导出断点记录每个超级表下所有已完成的导出文件（`completedFiles` 映射表）。每个分区写入的数据文件完成时即标记为已完成。
 
-**天内恢复**: 对于进行中被打断的天，使用 `lastExportTs` 在 WHERE 追加 `ts > lastExportTs`，由数据库端过滤已完成数据。
+中断恢复时，程序扫描所有分区文件，已完成的文件整体跳过，未完成的分区和文件重新执行。
+
+因为每个分区的时间窗口在构建时是确定的（基于 start-time/end-time + partitionWindowMinutes），
+
+恢复时重新构建的分区列表与中断前一致，已完成的文件不会重复导出。
+
+
 
 ```
-导出 2024-01-01 ~ 2024-01-05, 在第3天中断:
+
+导出 2024-01-01 00:00 ~ 2024-01-01 00:15, partition-window-minutes=5, 在第2个分区中断:
+
+
 
 断点记录:
-  completedDays: ["2024-01-01", "2024-01-02"]
-  currentDay: "2024-01-03"
-  lastExportTs: "1704326400000"  ← 第3天中某个时间戳
+
+  completedFiles:
+
+    "st1/20240101/slice_000000_00/st1_000000000.gz": 100000
+
+    "st1/20240101/slice_000500_01/st1_000500000.gz": 100000
+
+  currentFile: null
+
+  totalRecords: 200000
+
+
 
 恢复导出:
-  2024-01-01: 跳过 (已完成)
-  2024-01-02: 跳过 (已完成)
-  2024-01-03: SELECT ... WHERE ts >= '2024-01-03 00:00:00'
-              AND ts < '2024-01-04 00:00:00' AND ts > 1704326400000
-  2024-01-04: 正常导出
+
+  st1/20240101/slice_000000_00/ → 跳过 (completedFiles 中存在)
+
+  st1/20240101/slice_000500_01/ → 跳过 (completedFiles 中存在)
+
+  st1/20240101/slice_001000_02/ → 重新导出 (未完成)
+
 ```
+
 
 ### 导入断点: 基于文件+已提交行偏移
 
@@ -464,6 +582,29 @@ JDBC 原生连接始终使用 `SHOW STABLES`，不受此问题影响。
 
 ### 断点文件格式 (`{database}_progress.json`)
 
+```json
+{
+  "database": "test_db",
+  "mode": "EXPORT",
+  "lastUpdateTime": "2024-06-15T14:30:25",
+  "timeRangeStart": "2024-01-01T00:00:00",
+  "timeRangeEnd": "2025-01-01T00:00:00",
+  "stables": {
+    "st1": {
+      "schemaDone": true,
+      "completedFiles": {
+        "st1/20240101/slice_000000_00/st1_000000000.gz": 100000,
+        "st1/20240101/slice_000500_01/st1_000500000.gz": 100000,
+        "st1/20240102/slice_000000_00/st1_000000000.gz": 100000
+      },
+      "currentFile": null,
+      "currentFileOffset": 0,
+      "totalRecords": 300000,
+      "lastExportTs": null
+    }
+  }
+}
+```
 ```json
 {
   "database": "test_db",
@@ -507,7 +648,7 @@ JDBC 原生连接始终使用 `SHOW STABLES`，不受此问题影响。
 
 | # | 优化项 | 原方案 | 优化后 | 预估提升 |
 |---|--------|--------|--------|---------|
-| 1 | 并行导出 | 串行遍历超级表 | 30线程并行, 每线程独立连接, 单表按固定分片 | 30x (超级表数或分片数) |
+| 1 | 时间窗口分区并行 | 串行遍历超级表 | 时间窗口切分 + LIMIT/OFFSET分页 | 30x+ (窗口数x线程数) |
 | 2 | CSV格式替代JSON | 每行Jackson序列化 | StringBuilder直接拼接Tab分隔 | 5-10x (序列化) |
 | 3 | 时间戳断点恢复 | 重新查询+逐行跳过 | WHERE ts > lastExportTs | O(n)→O(1) |
 | 4 | 去除INDENT_OUTPUT | JSON美化缩进 | 数据文件无缩进 | 减少文件体积50%+ |
@@ -539,24 +680,29 @@ Thread-30: st30 ──── JDBC Connection 30 ───→ st30_*.gz
 
 **场景2: 单超级表 + 大量子表 → 时间窗口并行**
 
-当单超级表子表数很大时，按时间窗口并发导出：
+适用于单/多超级表，将时间范围按 `partition-window-minutes` 切分为独立时间窗口，并行导出：
 
 每个任务只扫描一次超级表，结果直接顺序写入单个输出流，达到 `file-size-mb` 后轮转。这样不会因为子表太多生成大量碎文件。
 
 ```
 1个超级表 st1, 100000个子表, parallel=30:
+每个分区独立查询 + LIMIT/OFFSET 分页拉取，达到 file-size-mb 后轮转文件。
+每个分区独立查询，结果通过 LIMIT/OFFSET 分页拉取（page-size 控制每页行数），
+避免 REST API 模式下 ResultSet 全量缓冲导致 OOM。
+达到 file-size-mb 后自动轮转生成新的 .gz 文件。
 
-1. 只查询一次: SELECT tbname, data_cols... FROM db.st1 ... ORDER BY ts ASC
-2. 顺序写入单个输出流
-3. 文件达到 100MB 后轮转生成下一个文件
+时间范围: 2024-01-01 00:00 ~ 00:30, partition-window-minutes=5
 
-Reader thread:  单次 ResultSet 扫描
-    ├── t1 → st1_*.gz
-    ├── t2 → st1_*.gz
-    └── t3 → st1_*.gz
+Partition-0:  st1  00:00~00:05  ──── LIMIT/OFFSET 分页 ────→ slice_000000_00/st1_*.gz
+Partition-1:  st1  00:05~00:10  ──── LIMIT/OFFSET 分页 ────→ slice_000500_01/st1_*.gz
+Partition-2:  st1  00:10~00:15  ──── LIMIT/OFFSET 分页 ────→ slice_001000_02/st1_*.gz
+  ...
+Partition-5:  st1  00:25~00:30  ──── LIMIT/OFFSET 分页 ────→ slice_002500_05/st1_*.gz
 
-文件名: {stable}_{timestamp}.gz
-文件在达到 `file-size-mb` 后自动轮转生成下一个文件。
+每个分区使用独立连接, 提交到线程池并行执行
+每个分区的 SQL 使用 WHERE ts >= 'wStart' AND ts < 'wEnd' 精确限定时间窗口
+每个分区输出到独立 slice_* 子目录, 按 file-size-mb 轮转文件
+所有分区完成后, 删除 checkpoint 文件
 ```
 
 ### 导入流水线详解
@@ -598,8 +744,8 @@ POISON信号: 生产者结束时向每个消费者发送终止信号
   
   PipelineCtx 内部类封装了每个流水线的可变状态:
     - header: 文件头部分字段(用于识别列位置)
-    - tagColumnIndices: tag列索引集合
-    - hasTbname: CSV是否含tbname列
+    - tagColumnIndices: 用于旧格式兼容的tag列索引
+    - hasTbname: CSV是否含tbname列(新格式始终含)
     - currentFileChildTable: 单子表模式下的子表名
   
   PipelineCtx 非线程安全, 但通过 BlockingQueue 的 happens-before 保证可见性
@@ -685,21 +831,25 @@ INSERT INTO t1 VALUES (...) (...) t2 VALUES (...) t3 VALUES (...);
 ./data/
 └── {database}/
     ├── {database}_schema.json          # Schema定义文件
-    ├── childtables/
-    │   ├── st1.jsonl.gz                # 流式子表清单（按超级表）
+    ├── structure/                       # 子表结构集
+    │   ├── st1.jsonl.gz                # 超级表 st1 的子表清单
     │   └── st2.jsonl.gz
     ├── {database}_progress.json        # 断点文件(运行中存在, 完成后删除)
-    ├── 20240115/                        # 日期子目录 (yyyyMMdd)
-    │   ├── st1_000000.gz               # st1当天第一个数据块(时间精确到毫秒)
-    │   ├── st1_102530.gz               # st1当天第二个数据块
-    │   └── st2_P0_081530.gz            # st2分区0的数据块
-    ├── 20240116/
-    │   ├── st1_000000.gz
-    │   └── st2_P0_093000.gz
-    └── 20240117/
-        └── st1_000000.gz
+    ├── st1/                             # 超级表 st1 的导出数据
+    │   ├── 20240115/                    # 日期子目录 (yyyyMMdd)
+    │   │   ├── slice_000000_00/         # 分区子目录: 00:00 ~ 00:05 窗口
+    │   │   │   ├── st1_000000000.gz    # 第1个数据文件
+    │   │   │   └── st1_000000000_2.gz  # 第2个数据文件(超 file-size-mb 轮转)
+    │   │   └── slice_000500_01/         # 分区子目录: 00:05 ~ 00:10 窗口
+    │   │       └── st1_000500000.gz
+    │   └── 20240116/
+    │       └── slice_000000_00/
+    │           └── st1_000000000.gz
+    └── st2/                             # 超级表 st2 的导出数据
+        └── 20240115/
+            └── slice_000000_00/
+                └── st2_000000000.gz
 ```
-
 ### Schema 文件 (`{database}_schema.json`)
 
 ```json
@@ -726,26 +876,45 @@ INSERT INTO t1 VALUES (...) (...) t2 VALUES (...) t3 VALUES (...);
 
 ### CSV 数据文件 (默认格式)
 
-Tab分隔，首行为列头，tag列以 `tag_` 前缀标识：
+
+
+Tab分隔，首行为列头，仅包含 tbname + 数据列（tag 列不写入数据文件，通过子表结构集单独导出）：
+
+
 
 ```
-tbname	ts	temperature	humidity	tag_device_id	tag_location
-t1	1705334730000	25.5	60.2	device1	beijing
-t1	1705334731000	25.6	60.1	device1	beijing
-t2	1705334732000	22.1	55.3	device2	shanghai
+
+tbname	ts	temperature	humidity
+
+t1	1705334730000	25.5	60.2
+
+t1	1705334731000	25.6	60.1
+
+t2	1705334732000	22.1	55.3
+
 ```
+
+
 
 - `NULL` 值表示为 `\N`
+
 - Timestamp 以毫秒值存储
+
 - 含 Tab/Newline 的字段用双引号包裹
+
+- tbname 为子表名，导入时用于确定写入哪个子表
+
+- tag 值通过 structure/{stable}.jsonl.gz 文件管理（导入时先执行结构集）
+
+
 
 ### JSON 数据文件 (兼容格式)
 
 每行一条记录 (JSON Lines):
 
 ```json
-{"tbname":"t1","ts":"2024-01-15T10:15:30Z","temperature":25.5,"humidity":60.2,"tag_device_id":"device1","tag_location":"beijing"}
-{"tbname":"t1","ts":"2024-01-15T10:15:31Z","temperature":25.6,"humidity":60.1,"tag_device_id":"device1","tag_location":"beijing"}
+{"tbname":"t1","ts":"2024-01-15T10:15:30Z","temperature":25.5,"humidity":60.2}
+{"tbname":"t1","ts":"2024-01-15T10:15:31Z","temperature":25.6,"humidity":60.1}
 ```
 
 ---
@@ -765,7 +934,9 @@ tdengine:
   file-size-mb: 100
 ```
 
-导出时会自动按天拆分，数据文件存入 `{yyyyMMdd}/` 日期子目录。
+导出时间范围自动按 partition-window-minutes 切分为时间窗口分区，
+数据文件存入 `{stableName}/{yyyyMMdd}/slice_*/` 子目录。
+可通过调整 partition-window-minutes 控制并行粒度（越小并行度越高但文件越多）。
 
 ### 示例2: 自动检测时间范围
 
@@ -793,9 +964,9 @@ tdengine:
     vibration: "amplitude > 0.5"
 ```
 
-每天生成的SQL:
-- temperature: `WHERE ts >= '{day} 00:00:00' AND ts < '{day+1} 00:00:00' AND temperature > 0`
-- pressure: `WHERE ts >= '{day} 00:00:00' AND ts < '{day+1} 00:00:00' AND pressure BETWEEN 900 AND 1100`
+每个分区生成的SQL类似（按时间窗口边界）：
+- temperature: `WHERE ts >=' {windowStart}' AND ts < '{windowEnd}' AND temperature > 0`
+- pressure: `WHERE ts >=' {windowStart}' AND ts < '{windowEnd}' AND pressure BETWEEN 900 AND 1100`
 
 ### 示例4: 仅导出/导入指定的超级表
 
@@ -919,12 +1090,4 @@ tdengine:
 **不一致时行为:**
 - 缺少列/标签 → 终止并提示
 - 类型不匹配 → 终止并提示
-- 长度不匹配 → 终止并提示
-- 目标有额外列/标签 → 仅警告（不影响导入）
-
-```
-ERROR - Schema inconsistency detected for super table: st1
-ERROR -   - column type mismatch for 'temperature': source=FLOAT, target=INT
-ERROR -   - Missing tag in target: location
-RuntimeException: Schema inconsistency for super table 'st1'. Import aborted.
-```
+- 长度不�
