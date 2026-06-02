@@ -37,7 +37,6 @@ public class TdDataImporter implements DataImporter {
     private static final long CHECKPOINT_SAVE_INTERVAL_MS = 30_000;
     private static final char FIELD_SEP = '\t';
     private static final String NULL_MARKER = "\\N";
-    private static final int CHILD_TABLE_BATCH_SIZE = 200;
 
     private static final class FileBatch {
         final String fileKey;
@@ -342,42 +341,159 @@ public class TdDataImporter implements DataImporter {
     private void reconcileChildTablesForStable(String database, String stableName, SuperTableMeta meta,
                                                Path manifestPath, Set<String> existingChildTables,
                                                TdConnection conn) {
-        int createdCount = 0;
-        int resetCount = 0;
-        int scannedCount = 0;
-
         try {
             List<ChildTableMeta> allChildren = readChildTableManifest(manifestPath, stableName);
             if (allChildren.isEmpty()) {
                 throw new RuntimeException("Child table manifest is empty: " + manifestPath);
             }
 
-            List<ChildTableMeta> batch = new ArrayList<>(CHILD_TABLE_BATCH_SIZE);
+            // Classify all children into missing/existing in one pass
+            List<ChildTableMeta> missing = new ArrayList<>();
+            List<ChildTableMeta> existing = new ArrayList<>();
             for (ChildTableMeta child : allChildren) {
                 if (child == null || child.getTbname() == null || child.getTbname().isBlank()) {
                     continue;
                 }
-                batch.add(child);
-                scannedCount++;
-                if (batch.size() >= CHILD_TABLE_BATCH_SIZE) {
-                    int[] counts = reconcileChildTableBatch(database, stableName, meta, batch, existingChildTables, conn);
-                    createdCount += counts[0];
-                    resetCount += counts[1];
-                    batch.clear();
+                if (existingChildTables.contains(child.getTbname())) {
+                    existing.add(child);
+                } else {
+                    missing.add(child);
                 }
             }
 
-            if (!batch.isEmpty()) {
-                int[] counts = reconcileChildTableBatch(database, stableName, meta, batch, existingChildTables, conn);
-                createdCount += counts[0];
-                resetCount += counts[1];
+            log.info("  [{}] Manifest: {} child tables ({} missing, {} existing)",
+                    stableName, allChildren.size(), missing.size(), existing.size());
+
+            // Phase 1: Create missing tables in parallel using multiple REST connections
+            int created = 0;
+            if (!missing.isEmpty()) {
+                created = createChildTablesParallel(database, stableName, meta, missing, existingChildTables);
+            }
+
+            // Phase 2: Verify existing tags sequentially (batched for memory efficiency)
+            int reset = 0;
+            if (!existing.isEmpty()) {
+                reset = verifyExistingChildTables(database, stableName, meta, existing, conn);
             }
 
             log.info("  [{}] Reconciled {} child table(s): created {}, reset {}",
-                    stableName, scannedCount, createdCount, resetCount);
+                    stableName, missing.size() + existing.size(), created, reset);
         } catch (Exception e) {
             throw new RuntimeException("Failed to reconcile child tables for " + stableName + ": " + e.getMessage(), e);
         }
+    }
+
+    /**
+     * Create child tables in parallel using multiple REST API connections.
+     * Each thread creates tables from a sublist and reports results via AtomicInteger.
+     */
+    private int createChildTablesParallel(String database, String stableName, SuperTableMeta meta,
+                                          List<ChildTableMeta> missing, Set<String> existingChildTables) throws Exception {
+        int threadCount = Math.min(properties.getParallel(), missing.size());
+        ExecutorService executor = Executors.newFixedThreadPool(threadCount,
+                r -> { Thread t = new Thread(r, "ddl-" + stableName); t.setDaemon(true); return t; });
+        AtomicInteger created = new AtomicInteger(0);
+        List<Future<Void>> futures = new ArrayList<>();
+
+        // Distribute missing tables evenly across threads
+        int chunkSize = Math.max(1, (missing.size() + threadCount - 1) / threadCount);
+        for (int start = 0; start < missing.size(); start += chunkSize) {
+            int end = Math.min(start + chunkSize, missing.size());
+            List<ChildTableMeta> chunk = missing.subList(start, end);
+            futures.add(executor.submit(() -> {
+                try (TdConnection createConn = connectionFactory.create()) {
+                    createConn.execute("USE " + database);
+                    for (ChildTableMeta child : chunk) {
+                        createConn.execute(buildCreateChildTableSql(stableName, child, meta));
+                        String key = stableName + ":" + child.getTbname();
+                        createdChildTables.add(key);
+                        // existingChildTables is only modified during creation; safe to synchronize on it
+                        synchronized (existingChildTables) {
+                            existingChildTables.add(child.getTbname());
+                        }
+                        created.incrementAndGet();
+                    }
+                }
+                return null;
+            }));
+        }
+        executor.shutdown();
+
+        // Collect errors
+        List<Exception> errors = new ArrayList<>();
+        for (Future<Void> f : futures) {
+            try {
+                f.get();
+            } catch (ExecutionException e) {
+                Throwable cause = e.getCause();
+                if (cause instanceof Exception ex) {
+                    errors.add(ex);
+                }
+            }
+        }
+
+        if (!errors.isEmpty()) {
+            for (Exception err : errors) {
+                log.error("  [{}] Parallel create error: {}", stableName, err.getMessage());
+            }
+            Exception first = errors.getFirst();
+            throw new RuntimeException("Parallel child table creation failed: " + errors.size()
+                    + " thread(s) had errors. First: " + first.getMessage(), first);
+        }
+
+        return created.get();
+    }
+
+    /**
+     * Verify existing child tables tag values and reset mismatched ones.
+     * Processes in batches to limit memory usage of tag queries.
+     */
+    private int verifyExistingChildTables(String database, String stableName, SuperTableMeta meta,
+                                          List<ChildTableMeta> existing, TdConnection conn) throws Exception {
+        int reset = 0;
+
+        List<ChildTableMeta> batch = new ArrayList<>(properties.getChildTableBatchSize());
+        for (ChildTableMeta child : existing) {
+            batch.add(child);
+            if (batch.size() >= properties.getChildTableBatchSize()) {
+                reset += verifyChildTableTagBatch(database, stableName, meta, batch, conn);
+                batch.clear();
+            }
+        }
+        if (!batch.isEmpty()) {
+            reset += verifyChildTableTagBatch(database, stableName, meta, batch, conn);
+        }
+
+        return reset;
+    }
+
+    private int verifyChildTableTagBatch(String database, String stableName, SuperTableMeta meta,
+                                         List<ChildTableMeta> batch, TdConnection conn) throws Exception {
+        Map<String, LinkedHashMap<String, String>> currentTags = queryChildTableTags(database, stableName, meta, batch, conn);
+        List<ChildTableMeta> needReset = new ArrayList<>();
+
+        for (ChildTableMeta child : batch) {
+            LinkedHashMap<String, String> current = currentTags.get(child.getTbname());
+            if (!tagsEqual(meta, current, child.getTagValues())) {
+                needReset.add(child);
+            }
+        }
+
+        if (!needReset.isEmpty()) {
+            // Reset tags individually — REST API does not reliably execute batch DDL
+            for (ChildTableMeta child : needReset) {
+                conn.execute(buildAlterChildTableTagSql(child, meta));
+            }
+            for (ChildTableMeta child : needReset) {
+                createdChildTables.add(stableName + ":" + child.getTbname());
+            }
+        } else {
+            for (ChildTableMeta child : batch) {
+                createdChildTables.add(stableName + ":" + child.getTbname());
+            }
+        }
+
+        return needReset.size();
     }
 
     private List<ChildTableMeta> readChildTableManifest(Path manifestPath, String stableName) throws Exception {
@@ -407,63 +523,6 @@ public class TdDataImporter implements DataImporter {
 
             return children;
         }
-    }
-
-    private int[] reconcileChildTableBatch(String database, String stableName, SuperTableMeta meta,
-                                           List<ChildTableMeta> batch, Set<String> existingChildTables,
-                                           TdConnection conn) throws Exception {
-        List<ChildTableMeta> missing = new ArrayList<>();
-        List<ChildTableMeta> existing = new ArrayList<>();
-
-        for (ChildTableMeta child : batch) {
-            if (existingChildTables.contains(child.getTbname())) {
-                existing.add(child);
-            } else {
-                missing.add(child);
-            }
-        }
-
-        int created = 0;
-        int reset = 0;
-
-        if (!missing.isEmpty()) {
-            for (ChildTableMeta child : missing) {
-                conn.execute(buildCreateChildTableSql(stableName, child, meta));
-            }
-            for (ChildTableMeta child : missing) {
-                String key = stableName + ":" + child.getTbname();
-                createdChildTables.add(key);
-                existingChildTables.add(child.getTbname());
-            }
-            created = missing.size();
-        }
-
-        if (!existing.isEmpty()) {
-            Map<String, LinkedHashMap<String, String>> currentTags = queryChildTableTags(database, stableName, meta, existing, conn);
-            List<ChildTableMeta> needReset = new ArrayList<>();
-            for (ChildTableMeta child : existing) {
-                LinkedHashMap<String, String> current = currentTags.get(child.getTbname());
-                if (!tagsEqual(meta, current, child.getTagValues())) {
-                    needReset.add(child);
-                }
-            }
-
-            if (!needReset.isEmpty()) {
-                for (ChildTableMeta child : needReset) {
-                    conn.execute(buildAlterChildTableTagSql(child, meta));
-                }
-                for (ChildTableMeta child : needReset) {
-                    createdChildTables.add(stableName + ":" + child.getTbname());
-                }
-                reset = needReset.size();
-            } else {
-                for (ChildTableMeta child : existing) {
-                    createdChildTables.add(stableName + ":" + child.getTbname());
-                }
-            }
-        }
-
-        return new int[]{created, reset};
     }
 
     private Map<String, LinkedHashMap<String, String>> queryChildTableTags(String database, String stableName,
@@ -525,10 +584,21 @@ public class TdDataImporter implements DataImporter {
     private String buildCreateChildTableSql(String stableName, ChildTableMeta child, SuperTableMeta meta) {
         StringBuilder sql = new StringBuilder();
         sql.append("CREATE TABLE IF NOT EXISTS `").append(child.getTbname()).append('`')
-                .append(" USING `").append(stableName).append("` TAGS (");
+                .append(" USING `").append(stableName).append("` (");
+        appendTagNames(sql, meta);
+        sql.append(") TAGS (");
         appendTagValues(sql, meta, child.getTagValues());
         sql.append(')');
         return sql.toString();
+    }
+
+    private void appendTagNames(StringBuilder sql, SuperTableMeta meta) {
+        boolean first = true;
+        for (DataColumn tag : meta.getTags()) {
+            if (!first) sql.append(", ");
+            sql.append('`').append(tag.getName()).append('`');
+            first = false;
+        }
     }
 
     private String buildAlterChildTableTagSql(ChildTableMeta child, SuperTableMeta meta) {
@@ -1109,41 +1179,15 @@ public class TdDataImporter implements DataImporter {
                 grouped.computeIfAbsent(tbname, k -> new ArrayList<>()).add(line);
             }
 
-            // Track child tables created ON THIS CONNECTION to avoid USING TAGS on confirmed tables
-            Set<String> locallyCreated = new HashSet<>();
-            // If child table manifest is loaded, pre-populate with all known child tables for this super table
-            locallyCreated.addAll(createdChildTables);
+            // All child tables already created during reconciliation — no USING TAGS needed
 
             for (Map.Entry<String, List<String>> entry : grouped.entrySet()) {
                 String tbname = entry.getKey();
                 List<String> tableRecords = entry.getValue();
                 if (tableRecords.isEmpty()) continue;
 
-                String childTableKey = stableName + ":" + tbname;
-
                 StringBuilder sql = new StringBuilder(tableRecords.size() * 96 + 64);
-                sql.append("INSERT INTO `").append(tbname).append('`');
-
-                // Use connection-local cache to avoid TDengine REST mode visibility issues:
-                // If this connection has already created this child table locally, no USING needed.
-                // Otherwise, always use USING TAGS to be safe (table may exist globally but not
-                // yet visible on this connection in REST mode).
-                if (!locallyCreated.contains(childTableKey)) {
-                    locallyCreated.add(childTableKey);
-                    createdChildTables.add(childTableKey); // global tracking (best-effort)
-
-                    sql.append(" USING ").append('`').append(stableName).append('`').append(" TAGS (");
-
-                    if (properties.getFormat() == SyncProperties.DataFormat.CSV) {
-                        appendTagValuesFromCsv(sql, tableRecords.getFirst(), ctx);
-                    } else {
-                        appendTagValuesFromJson(sql, tableRecords.getFirst(), tagColumnNames);
-                    }
-
-                    sql.append(')');
-                }
-
-                sql.append(" VALUES ");
+                sql.append("INSERT INTO `").append(tbname).append("` VALUES ");
 
                 for (int i = 0; i < tableRecords.size(); i++) {
                     if (i > 0) sql.append(' ');
@@ -1155,13 +1199,11 @@ public class TdDataImporter implements DataImporter {
                     }
                 }
 
-                String groupSql = sql.toString();
                 try {
-                    conn.execute(groupSql);
+                    conn.execute(sql.toString());
                 } catch (Exception e) {
-                    // Log full SQL for debugging, then rethrow
                     log.error("Batch insert FAILED for super table {}, child table {}:\n  SQL (first 2000 chars): {}\n  Error: {}",
-                            stableName, tbname, groupSql.substring(0, Math.min(groupSql.length(), 2000)), e.getMessage());
+                            stableName, tbname, sql.substring(0, Math.min(sql.length(), 2000)), e.getMessage());
                     throw new RuntimeException("Batch insert failed: " + e.getMessage(), e);
                 }
             }
@@ -1447,49 +1489,19 @@ public class TdDataImporter implements DataImporter {
         if (value.isEmpty()) return false;
         boolean hasDigit = false;
         boolean hasDot = false;
+        boolean hasExp = false;
         for (int i = 0; i < value.length(); i++) {
             char c = value.charAt(i);
             if (c == '-' && i == 0) continue;
-            if (c == '.' && !hasDot) { hasDot = true; continue; }
-            if ((c == 'e' || c == 'E') && i > 0) continue;
-            if (c == '+' && i > 0 && (value.charAt(i - 1) == 'e' || value.charAt(i - 1) == 'E')) continue;
+            if (c == '.' && !hasDot && !hasExp) { hasDot = true; continue; }
+            if ((c == 'e' || c == 'E') && hasDigit && !hasExp) { hasExp = true; continue; }
+            if (c == '+' && hasExp && i > 0
+                    && (value.charAt(i - 1) == 'e' || value.charAt(i - 1) == 'E')) continue;
             if (Character.isDigit(c)) { hasDigit = true; continue; }
             return false;
         }
-        return hasDigit;
+        // Must contain at least one digit AND must end with a digit (not e/E/+/-/.)
+        return hasDigit && Character.isDigit(value.charAt(value.length() - 1));
     }
 
-    /**
-     * Sanitize a CREATE STABLE statement by removing trailing options (e.g. SECURE_DELETE, WATERMARK)
-     * that may not be supported by the target TDengine version.
-     * Keeps only the core DDL: CREATE STABLE ... (columns) TAGS (tags)
-     */
-    static String sanitizeCreateStable(String createStmt) {
-        int tagsIdx = createStmt.indexOf("TAGS (");
-        if (tagsIdx < 0) {
-            // Try lowercase
-            tagsIdx = createStmt.toUpperCase().indexOf("TAGS (");
-            if (tagsIdx < 0) return createStmt.trim();
-        }
-
-        // Find the matching closing paren after "TAGS ("
-        int parenDepth = 0;
-        boolean inParen = false;
-        for (int i = tagsIdx; i < createStmt.length(); i++) {
-            char c = createStmt.charAt(i);
-            if (c == '(') {
-                parenDepth++;
-                inParen = true;
-            } else if (c == ')') {
-                parenDepth--;
-                if (inParen && parenDepth == 0) {
-                    // Found the closing paren of TAGS clause
-                    return createStmt.substring(0, i + 1).trim();
-                }
-            }
-        }
-
-        // Fallback: if we can't parse properly, just trim the input
-        return createStmt.trim();
-    }
-}
+    /*

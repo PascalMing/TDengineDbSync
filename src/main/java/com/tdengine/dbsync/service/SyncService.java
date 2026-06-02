@@ -72,9 +72,9 @@ public class SyncService {
         checkpointManager.registerShutdownHook();
 
         try {
-            validateStableConditions(properties.getDatabase());
             switch (properties.getMode()) {
                 case EXPORT -> {
+                    validateStableConditions(properties.getDatabase());
                     DataExporter exporter = new TdDataExporter(properties, connectionFactory, checkpointManager);
                     exporter.exportData();
                 }

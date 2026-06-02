@@ -55,6 +55,8 @@ tdengine:
   parallel: 50
   # Batch insert size for import (larger = fewer HTTP round-trips)
   batch-size: 5000
+  # Child table creation batch size for import (default 200)
+  child-table-batch-size: 200
   # Pipeline queue size (number of batches buffered between reader and writer)
   pipeline-queue-size: 50
   # Connection pool size (0 disables pooling, default 50)

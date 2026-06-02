@@ -60,6 +60,8 @@ public class SyncProperties {
     private int parallel = 30;
     /** Batch insert size for import, default 5000 */
     private int batchSize = 5000;
+    /** Child table creation batch size for import, default 200 */
+    private int childTableBatchSize = 200;
     /** Pipeline queue size for import (number of batches buffered) */
     private int pipelineQueueSize = 10;
     /** Connection pool size (0 disables pooling, default 50) */
@@ -269,6 +271,14 @@ public class SyncProperties {
 
     public void setBatchSize(int batchSize) {
         this.batchSize = batchSize;
+    }
+
+    public int getChildTableBatchSize() {
+        return childTableBatchSize;
+    }
+
+    public void setChildTableBatchSize(int childTableBatchSize) {
+        this.childTableBatchSize = childTableBatchSize;
     }
 
     public int getPipelineQueueSize() {
