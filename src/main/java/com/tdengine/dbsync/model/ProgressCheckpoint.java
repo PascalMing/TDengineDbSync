@@ -113,6 +113,12 @@ public class ProgressCheckpoint {
         private final Set<String> completedDays = ConcurrentHashMap.newKeySet();
         /** Currently processing day string (e.g. "2024-01-15") */
         private volatile String currentDay;
+        /**
+         * Whether all child table tags have been verified (reset=0 on last run).
+         * When true, the reconciliation phase skips tag verification entirely,
+         * avoiding 280k+ SELECT + ALTER TABLE calls on re-import.
+         */
+        private boolean tagsVerified;
 
         public StableProgress() {
         }
@@ -215,6 +221,14 @@ public class ProgressCheckpoint {
                 currentDay = null;
                 lastExportTs = null;
             }
+        }
+
+        public boolean isTagsVerified() {
+            return tagsVerified;
+        }
+
+        public synchronized void setTagsVerified(boolean tagsVerified) {
+            this.tagsVerified = tagsVerified;
         }
     }
 }

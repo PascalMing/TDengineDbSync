@@ -29,6 +29,14 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class TdDataImporter implements DataImporter {
 
@@ -367,13 +375,28 @@ public class TdDataImporter implements DataImporter {
             // Phase 1: Create missing tables in parallel using multiple REST connections
             int created = 0;
             if (!missing.isEmpty()) {
+                ProgressCheckpoint.StableProgress sp = checkpointManager.getCheckpoint().getOrCreateStable(stableName);
+                sp.setTagsVerified(false);  // new tables require re-verification
                 created = createChildTablesParallel(database, stableName, meta, missing, existingChildTables);
             }
 
-            // Phase 2: Verify existing tags sequentially (batched for memory efficiency)
+            // Phase 2: Verify existing tags (parallel, batched for memory efficiency)
             int reset = 0;
             if (!existing.isEmpty()) {
-                reset = verifyExistingChildTables(database, stableName, meta, existing, conn);
+                ProgressCheckpoint.StableProgress sp = checkpointManager.getCheckpoint().getOrCreateStable(stableName);
+                if (sp.isTagsVerified()) {
+                    log.info("  [{}] Tags already verified from previous run, skipping {} existing table(s)",
+                            stableName, existing.size());
+                    for (ChildTableMeta child : existing) {
+                        createdChildTables.add(stableName + ":" + child.getTbname());
+                    }
+                } else {
+                    reset = verifyExistingChildTables(database, stableName, meta, existing, conn);
+                    if (reset == 0) {
+                        sp.setTagsVerified(true);
+                        checkpointManager.markDirty();
+                    }
+                }
             }
 
             log.info("  [{}] Reconciled {} child table(s): created {}, reset {}",
@@ -446,25 +469,78 @@ public class TdDataImporter implements DataImporter {
 
     /**
      * Verify existing child tables tag values and reset mismatched ones.
-     * Processes in batches to limit memory usage of tag queries.
+     * Batches are processed in parallel using multiple REST connections.
      */
     private int verifyExistingChildTables(String database, String stableName, SuperTableMeta meta,
                                           List<ChildTableMeta> existing, TdConnection conn) throws Exception {
-        int reset = 0;
-
+        // Pre-compute all batches
+        List<List<ChildTableMeta>> batches = new ArrayList<>();
         List<ChildTableMeta> batch = new ArrayList<>(properties.getChildTableBatchSize());
         for (ChildTableMeta child : existing) {
             batch.add(child);
             if (batch.size() >= properties.getChildTableBatchSize()) {
-                reset += verifyChildTableTagBatch(database, stableName, meta, batch, conn);
-                batch.clear();
+                batches.add(batch);
+                batch = new ArrayList<>(properties.getChildTableBatchSize());
             }
         }
         if (!batch.isEmpty()) {
-            reset += verifyChildTableTagBatch(database, stableName, meta, batch, conn);
+            batches.add(batch);
         }
 
-        return reset;
+        if (batches.size() <= 1) {
+            int reset = 0;
+            for (List<ChildTableMeta> b : batches) {
+                reset += verifyChildTableTagBatch(database, stableName, meta, b, conn);
+            }
+            return reset;
+        }
+
+        // Parallel execution: each thread uses its own REST connection
+        int threadCount = Math.min(properties.getParallel(), batches.size());
+        ExecutorService executor = Executors.newFixedThreadPool(threadCount, r -> {
+            Thread t = new Thread(r, "tag-verify-" + stableName);
+            t.setDaemon(true);
+            return t;
+        });
+
+        AtomicInteger totalReset = new AtomicInteger(0);
+        List<Future<Void>> futures = new ArrayList<>();
+
+        for (List<ChildTableMeta> taskBatch : batches) {
+            futures.add(executor.submit(() -> {
+                try (TdConnection taskConn = connectionFactory.create()) {
+                    taskConn.execute("USE " + database);
+                    int reset = verifyChildTableTagBatch(database, stableName, meta, taskBatch, taskConn);
+                    totalReset.addAndGet(reset);
+                }
+                return null;
+            }));
+        }
+        executor.shutdown();
+
+        // Collect errors
+        List<Exception> errors = new ArrayList<>();
+        for (Future<Void> f : futures) {
+            try {
+                f.get();
+            } catch (ExecutionException e) {
+                Throwable cause = e.getCause();
+                if (cause instanceof Exception ex) {
+                    errors.add(ex);
+                }
+            }
+        }
+
+        if (!errors.isEmpty()) {
+            for (Exception err : errors) {
+                log.error("  [{}] Parallel tag verify error: {}", stableName, err.getMessage());
+            }
+            Exception first = errors.get(0);
+            throw new RuntimeException("Parallel tag verification failed: " + errors.size()
+                    + " thread(s) had errors. First: " + first.getMessage(), first);
+        }
+
+        return totalReset.get();
     }
 
     private int verifyChildTableTagBatch(String database, String stableName, SuperTableMeta meta,
@@ -480,9 +556,21 @@ public class TdDataImporter implements DataImporter {
         }
 
         if (!needReset.isEmpty()) {
-            // Reset tags individually — REST API does not reliably execute batch DDL
+            // Batch DDL: join ALTER TABLE statements with semicolons
+            // to reduce REST API round-trips. Fall back to individual execution
+            // if the batch fails (e.g., connection-specific limitation).
+            StringBuilder batchSql = new StringBuilder();
             for (ChildTableMeta child : needReset) {
-                conn.execute(buildAlterChildTableTagSql(child, meta));
+                batchSql.append(buildAlterChildTableTagSql(child, meta)).append(";");
+            }
+            try {
+                conn.execute(batchSql.toString());
+            } catch (Exception batchEx) {
+                log.debug("  [{}] Batch ALTER TABLE failed, falling back to individual: {}",
+                        stableName, batchEx.getMessage());
+                for (ChildTableMeta child : needReset) {
+                    conn.execute(buildAlterChildTableTagSql(child, meta));
+                }
             }
             for (ChildTableMeta child : needReset) {
                 createdChildTables.add(stableName + ":" + child.getTbname());
@@ -574,11 +662,74 @@ public class TdDataImporter implements DataImporter {
         }
         for (DataColumn tag : meta.getTags()) {
             String name = tag.getName();
-            if (!Objects.equals(current.get(name), expected.get(name))) {
+            String cur = current.get(name);
+            String exp = expected.get(name);
+            if (!normalizedEquals(tag.getType(), cur, exp)) {
                 return false;
             }
         }
         return true;
+    }
+
+    /**
+     * Compare two tag values with type-aware normalization, so that different
+     * string representations of the same logical value are treated as equal.
+     * <p>
+     * The manifest (expected) values come from JSON deserialization.
+     * The current values come from {@code rs.getObject().toString()} over REST.
+     * These two paths can produce different strings for the same value, e.g.:
+     * TIMESTAMP: {@code "2026-05-05T00:00:00"} vs {@code "2026-05-05 00:00:00.0"}
+     * DOUBLE:    {@code "1.0"} vs {@code "1"}
+     * Without normalization, every existing child table would be ALTER TABLE'd
+     * on every re-import, even though the tags are already correct.
+     */
+    private boolean normalizedEquals(String type, String a, String b) {
+        if (isNullish(a) && isNullish(b)) return true;
+        if (isNullish(a) || isNullish(b)) return false;
+
+        String ut = type.toUpperCase();
+
+        if (isNumericType(ut)) {
+            return normalizedNumericEquals(a, b);
+        }
+        if (ut.equals("TIMESTAMP")) {
+            return normalizedTimestampEquals(a, b);
+        }
+        if (ut.equals("BOOL") || ut.equals("BOOLEAN")) {
+            return a.equalsIgnoreCase(b);
+        }
+        // String types: NCHAR, BINARY, VARCHAR, etc.
+        return Objects.equals(a, b);
+    }
+
+    private boolean isNullish(String s) {
+        return s == null || s.isEmpty() || "null".equalsIgnoreCase(s) || NULL_MARKER.equals(s);
+    }
+
+    private boolean isNumericType(String type) {
+        return type.equals("TINYINT") || type.startsWith("TINYINT UNSIGNED")
+                || type.equals("SMALLINT") || type.startsWith("SMALLINT UNSIGNED")
+                || type.equals("INT") || type.startsWith("INT UNSIGNED")
+                || type.equals("BIGINT") || type.startsWith("BIGINT UNSIGNED")
+                || type.equals("FLOAT") || type.equals("DOUBLE")
+                || type.startsWith("DECIMAL") || type.startsWith("NUMBER");
+    }
+
+    private boolean normalizedNumericEquals(String a, String b) {
+        try {
+            BigDecimal da = new BigDecimal(a.trim());
+            BigDecimal db = new BigDecimal(b.trim());
+            return da.compareTo(db) == 0;
+        } catch (NumberFormatException e) {
+            return Objects.equals(a, b);
+        }
+    }
+
+    private boolean normalizedTimestampEquals(String a, String b) {
+        // Canonicalize: replace T with space, strip trailing .0 / .00 / .000 etc.
+        String na = a.trim().replace('T', ' ').replaceAll("\\.0+$", "");
+        String nb = b.trim().replace('T', ' ').replaceAll("\\.0+$", "");
+        return Objects.equals(na, nb);
     }
 
     private String buildCreateChildTableSql(String stableName, ChildTableMeta child, SuperTableMeta meta) {
@@ -1028,6 +1179,10 @@ public class TdDataImporter implements DataImporter {
             dateDirs.sort(Comparator.comparing(p -> p.getFileName().toString()));
 
             for (Path dateDir : dateDirs) {
+                // Quick date-level skip for time range filtering
+                if (isDateDirOutsideRange(dateDir.getFileName().toString())) {
+                    continue;
+                }
                 List<Path> sliceDirs = new ArrayList<>();
                 try (DirectoryStream<Path> stream = Files.newDirectoryStream(dateDir, entry ->
                         Files.isDirectory(entry) && entry.getFileName().toString().startsWith("slice_"))) {
@@ -1071,6 +1226,10 @@ public class TdDataImporter implements DataImporter {
         dateDirs.sort(Comparator.comparing(p -> p.getFileName().toString()));
 
         for (Path dateDir : dateDirs) {
+            // Quick date-level skip for time range filtering
+            if (isDateDirOutsideRange(dateDir.getFileName().toString())) {
+                continue;
+            }
             try (DirectoryStream<Path> stream = Files.newDirectoryStream(dateDir, "*.gz")) {
                 List<Path> dayFiles = new ArrayList<>();
                 for (Path entry : stream) {
@@ -1100,7 +1259,144 @@ public class TdDataImporter implements DataImporter {
             }
         }
 
+        if (properties.hasTimeRange() && !files.isEmpty()) {
+            files = filterByTimeRange(files, dataDir);
+        }
+
         return files;
+    }
+
+    /**
+     * Filter data files to only those within the configured time range [startTime, endTime).
+     * Uses directory structure (yyyyMMdd) and filename timestamp (HHmmssSSS) for fast
+     * identification without reading file contents.
+     */
+    private List<Path> filterByTimeRange(List<Path> files, Path dataDir) {
+        LocalDateTime start = properties.parseStartTime();
+        LocalDateTime end = properties.parseEndTime();
+
+        List<Path> filtered = new ArrayList<>();
+        int skipped = 0;
+
+        for (Path file : files) {
+            if (!isFileOutsideRange(file, dataDir, start, end)) {
+                filtered.add(file);
+            } else {
+                skipped++;
+            }
+        }
+
+        if (skipped > 0) {
+            log.info("  Filtered out {} file(s) outside time range, {} file(s) to import",
+                    skipped, filtered.size());
+        }
+
+        return filtered;
+    }
+
+    /**
+     * Determine if a data file is outside the configured time range.
+     * Extracts date from directory name and time from file name without reading contents.
+     *
+     * <p>Path formats supported:
+     * <ul>
+     *   <li>New: {@code {stableName}/{yyyyMMdd}/slice_{HHmmss}_{idx}/{stableName}_{HHmmssSSS}.gz}</li>
+     *   <li>Old: {@code {yyyyMMdd}/{stableName}_{HHmmssSSS}.gz}</li>
+     *   <li>Flat: {@code {stableName}_{HHmmssSSS}.gz} — no date dir, kept (conservative)</li>
+     * </ul>
+     */
+    private boolean isFileOutsideRange(Path file, Path dataDir, LocalDateTime start, LocalDateTime end) {
+        if (start == null && end == null) return false;
+
+        Path relative = dataDir.relativize(file);
+        int count = relative.getNameCount();
+        String fileName = relative.getFileName().toString();
+
+        LocalDate fileDate = null;
+        LocalTime fileTime = null;
+
+        if (count >= 4) {
+            // New format: stableName/yyyyMMdd/slice_HHmmss_index/stableName_HHmmssSSS.gz
+            String dateStr = relative.getName(1).toString();
+            if (dateStr.matches("\\d{8}")) {
+                try {
+                    fileDate = LocalDate.parse(dateStr, DateTimeFormatter.ofPattern("yyyyMMdd"));
+                } catch (DateTimeParseException ignored) {}
+            }
+            fileTime = extractTimeFromFileName(fileName);
+        } else if (count >= 2) {
+            // Old format: yyyyMMdd/stableName_HHmmssSSS.gz
+            String dateStr = relative.getName(0).toString();
+            if (dateStr.matches("\\d{8}")) {
+                try {
+                    fileDate = LocalDate.parse(dateStr, DateTimeFormatter.ofPattern("yyyyMMdd"));
+                } catch (DateTimeParseException ignored) {}
+            }
+            fileTime = extractTimeFromFileName(fileName);
+        }
+        // Flat format: no date directory → can't determine date, include file
+
+        if (fileDate == null) {
+            return false;
+        }
+
+        // Quick date-level check
+        if (start != null && fileDate.isBefore(start.toLocalDate())) return true;
+        if (end != null && fileDate.isAfter(end.toLocalDate())) return true;
+
+        // For boundary dates (first/last day of range), use time-level precision
+        // when the filename contains a parsable HHmmssSSS timestamp.
+        if (fileTime == null) return false;
+
+        boolean onStartDay = start != null && fileDate.equals(start.toLocalDate());
+        boolean onEndDay = end != null && fileDate.equals(end.toLocalDate());
+
+        if (onStartDay || onEndDay) {
+            LocalDateTime fileDateTime = fileDate.atTime(fileTime);
+            if (onStartDay && fileDateTime.isBefore(start)) return true;
+            if (onEndDay && !fileDateTime.isBefore(end)) return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Extract HHmmssSSS (9 digits) from filename like {@code stable_history_data_144501158.gz}
+     * or {@code stable_history_data_144501158_2.gz} (with file rotation index).
+     *
+     * @return parsed LocalTime or null if no valid timestamp found
+     */
+    private LocalTime extractTimeFromFileName(String fileName) {
+        Pattern p = Pattern.compile("_(\\d{9})(?:_\\d+)?\\.gz$");
+        Matcher m = p.matcher(fileName);
+        if (m.find()) {
+            String timeStr = m.group(1);
+            try {
+                int h = Integer.parseInt(timeStr.substring(0, 2));
+                int mi = Integer.parseInt(timeStr.substring(2, 4));
+                int s = Integer.parseInt(timeStr.substring(4, 6));
+                int ms = Integer.parseInt(timeStr.substring(6, 9));
+                return LocalTime.of(h, mi, s, ms * 1_000_000);
+            } catch (Exception ignored) {}
+        }
+        return null;
+    }
+
+    /**
+     * Quick pure-date check: is a yyyyMMdd date directory completely outside
+     * the configured time range? Used for fast directory-level skipping before
+     * scanning files within a date directory.
+     */
+    private boolean isDateDirOutsideRange(String dateStr) {
+        if (!properties.hasTimeRange()) return false;
+        try {
+            LocalDate dirDate = LocalDate.parse(dateStr, DateTimeFormatter.ofPattern("yyyyMMdd"));
+            LocalDateTime start = properties.parseStartTime();
+            LocalDateTime end = properties.parseEndTime();
+            if (start != null && dirDate.isBefore(start.toLocalDate())) return true;
+            if (end != null && dirDate.isAfter(end.toLocalDate())) return true;
+        } catch (DateTimeParseException ignored) {}
+        return false;
     }
 
     /**
@@ -1504,4 +1800,49 @@ public class TdDataImporter implements DataImporter {
         return hasDigit && Character.isDigit(value.charAt(value.length() - 1));
     }
 
-    /*
+    /**
+     * Sanitize a CREATE STABLE statement by removing trailing options (e.g. SECURE_DELETE, WATERMARK)
+     * that may not be supported by the target TDengine version.
+     * Keeps only the core DDL: CREATE STABLE ... (columns) TAGS (tags)
+     */
+    static String sanitizeCreateStable(String createStmt) {
+        int tagsIdx = createStmt.indexOf("TAGS (");
+        if (tagsIdx < 0) {
+            // Try lowercase
+            tagsIdx = createStmt.toUpperCase().indexOf("TAGS (");
+            if (tagsIdx < 0) {
+                // No TAGS clause — inject IF NOT EXISTS and return
+                return injectIfNotExists(createStmt.trim());
+            }
+        }
+
+        // Find the matching closing paren after "TAGS ("
+        int parenDepth = 0;
+        boolean inParen = false;
+        for (int i = tagsIdx; i < createStmt.length(); i++) {
+            char c = createStmt.charAt(i);
+            if (c == '(') {
+                parenDepth++;
+                inParen = true;
+            } else if (c == ')') {
+                parenDepth--;
+                if (inParen && parenDepth == 0) {
+                    // Found the closing paren of TAGS clause
+                    return injectIfNotExists(createStmt.substring(0, i + 1).trim());
+                }
+            }
+        }
+
+        // Fallback: if we can't parse properly, just trim and inject IF NOT EXISTS
+        return injectIfNotExists(createStmt.trim());
+    }
+
+    /**
+     * Inject IF NOT EXISTS into a CREATE STABLE statement if not already present.
+     */
+    private static String injectIfNotExists(String ddl) {
+        if (ddl == null || ddl.isBlank()) return ddl;
+        if (ddl.toUpperCase().contains("IF NOT EXISTS")) return ddl;
+        return ddl.replaceFirst("(?i)CREATE\\s+STABLE\\s+", "CREATE STABLE IF NOT EXISTS ");
+    }
+}
