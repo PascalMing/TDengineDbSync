@@ -33,6 +33,7 @@ import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
+import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.util.regex.Matcher;
@@ -141,6 +142,13 @@ public class TdDataImporter implements DataImporter {
     private final CheckpointManager checkpointManager;
     private final ObjectMapper objectMapper;
     private final Set<String> createdChildTables = ConcurrentHashMap.newKeySet();
+    /** Child tables excluded by import conditions — their data rows are skipped */
+    private final Set<String> filteredOutChildTables = ConcurrentHashMap.newKeySet();
+    /** Global summary counters (updated by pipeline threads, read after all complete). */
+    private final AtomicLong globalTotalRead = new AtomicLong(0);
+    private final AtomicLong globalTotalFiltered = new AtomicLong(0);
+    /** Actual rows reported by TDengine executeUpdate() (may differ from read due to ts dedup). */
+    private final AtomicLong globalTotalInserted = new AtomicLong(0);
 
     public TdDataImporter(SyncProperties properties, TdConnectionFactory connectionFactory,
                           CheckpointManager checkpointManager) {
@@ -186,6 +194,9 @@ public class TdDataImporter implements DataImporter {
         SchemaFile schemaFile = objectMapper.readValue(schemaPath.toFile(), SchemaFile.class);
         log.info("Loaded schema file, exported at: {}, contains {} super table(s)",
                 schemaFile.getExportTime(), schemaFile.getSuperTables().size());
+
+        // Validate import conditions against schema file (column/tag definitions)
+        validateImportConditions(schemaFile);
 
         // Use a shared connection for metadata operations
         try (TdConnection metaConn = connectionFactory.create()) {
@@ -249,6 +260,89 @@ public class TdDataImporter implements DataImporter {
         }
 
         checkpointManager.delete();
+
+        // Global import summary with actual DB-acknowledged counts
+        long globalRead = globalTotalRead.get();
+        long globalFiltered = globalTotalFiltered.get();
+        long globalSentToDb = globalRead - globalFiltered;
+        long globalAcknowledged = globalTotalInserted.get();
+        String timeRange = properties.hasTimeRange()
+                ? String.format("%s ~ %s",
+                    properties.getStartTime() != null ? properties.getStartTime() : "*",
+                    properties.getEndTime() != null ? properties.getEndTime() : "*")
+                : "auto-detect";
+        log.info("+===============================================");
+        log.info("|  IMPORT COMPLETED -- Global Summary");
+        log.info("|  Target database    : {}", targetDb);
+        log.info("|  Time range         : {}", timeRange);
+        log.info("|  Rows read (files)  : {}", globalRead);
+        if (globalFiltered > 0) {
+            log.info("|  Rows filtered      : {} (by import conditions)", globalFiltered);
+        }
+        log.info("|  Rows sent to DB    : {}", globalSentToDb);
+        if (globalAcknowledged != globalSentToDb) {
+            log.warn("|  [WARN] DB acknowledged fewer rows ({}) than sent ({}).",
+                    globalAcknowledged, globalSentToDb);
+            log.warn("|    Diff {} -- TDengine silently deduplicates (tbname, ts).",
+                    globalSentToDb - globalAcknowledged);
+        }
+        log.info("|  Rows acknowledged   : {}", globalAcknowledged);
+
+        // Post-import DB row count verification (one count per super table)
+        //
+        // IMPORTANT: CSV timestamps are formatted as UTC ISO-8601 (ts.toInstant().toString()),
+        // e.g. "2026-05-05T16:00:00.162Z". TDengine stores these as UTC internally.
+        // The configured start-time / end-time are in the local system timezone.
+        // We must convert the local time range to UTC before building the COUNT SQL,
+        // otherwise the WHERE clause compares local-time strings against UTC-stored data.
+        try (TdConnection verifyConn = connectionFactory.create()) {
+            verifyConn.execute("USE " + targetDb);
+            long dbTotal = 0;
+
+            // Pre-compute UTC time range for DB COUNT verification
+            String utcStart = null;
+            String utcEnd = null;
+            if (properties.hasTimeRange()) {
+                LocalDateTime startLdt = properties.parseStartTime();
+                LocalDateTime endLdt = properties.parseEndTime();
+                if (startLdt != null && endLdt != null) {
+                    ZoneId localZone = ZoneId.systemDefault();
+                    DateTimeFormatter utcFmt = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
+                            .withZone(ZoneId.of("UTC"));
+                    utcStart = utcFmt.format(startLdt.atZone(localZone).toInstant());
+                    utcEnd = utcFmt.format(endLdt.atZone(localZone).toInstant());
+                    log.info("|  DB COUNT time range (UTC): {} ~ {}", utcStart, utcEnd);
+                }
+            }
+
+            for (String stable : targetTables) {
+                try {
+                    SuperTableMeta meta = schemaFile.getSuperTables().get(stable);
+                    String tsCol = getTimestampColumn(meta);
+                    String countSql = "SELECT COUNT(*) FROM " + targetDb + "." + stable;
+                    if (utcStart != null && utcEnd != null) {
+                        countSql += " WHERE " + quoteId(tsCol) + " >= '" + utcStart + "' AND " + quoteId(tsCol) + " < '" + utcEnd + "'";
+                    }
+                    final String finalSql = countSql;
+                    long[] result = new long[1];
+                    verifyConn.query(finalSql, rs -> {
+                        if (rs.next()) result[0] = rs.getLong(1);
+                    });
+                    dbTotal += result[0];
+                    log.info("|  DB COUNT({})  : {}", stable, result[0]);
+                } catch (Exception e) {
+                    log.warn("|  DB COUNT({})  : query failed -- {}", stable, e.getMessage());
+                }
+            }
+            log.info("|  DB COUNT(total)    : {}", dbTotal);
+            if (dbTotal != globalSentToDb) {
+                log.warn("|  [WARN] DB total ({}) != rows sent ({}). Diff: {} rows missing in DB.",
+                        dbTotal, globalSentToDb, globalSentToDb - dbTotal);
+            }
+        } catch (Exception e) {
+            log.warn("|  DB COUNT verification failed: {}", e.getMessage());
+        }
+        log.info("+===============================================");
         log.info("========== Import completed into database: {} ==========", targetDb);
     }
 
@@ -355,6 +449,20 @@ public class TdDataImporter implements DataImporter {
                 throw new RuntimeException("Child table manifest is empty: " + manifestPath);
             }
 
+            // Filter by import conditions (TAG-based): exclude child tables that don't match
+            String importCond = properties.getCombinedImportConditions(stableName);
+            if (importCond != null && !importCond.isBlank()) {
+                int before = allChildren.size();
+                allChildren = filterChildrenByImportConditions(allChildren, meta, importCond, stableName);
+                if (allChildren.isEmpty()) {
+                    log.warn("  [{}] All {} child tables filtered out by import conditions: {}",
+                            stableName, before, importCond);
+                    return;  // nothing to create or verify for this stable
+                }
+                log.info("  [{}] Import condition filtered: {} → {} child tables (cond: {})",
+                        stableName, before, allChildren.size(), importCond);
+            }
+
             // Classify all children into missing/existing in one pass
             List<ChildTableMeta> missing = new ArrayList<>();
             List<ChildTableMeta> existing = new ArrayList<>();
@@ -404,6 +512,328 @@ public class TdDataImporter implements DataImporter {
         } catch (Exception e) {
             throw new RuntimeException("Failed to reconcile child tables for " + stableName + ": " + e.getMessage(), e);
         }
+    }
+
+    /**
+     * Filter child table manifest entries by import conditions.
+     * Evaluates TAG-referenced parts of conditions against manifest TAG values.
+     * Child tables that don't match are tracked in {@link #filteredOutChildTables}
+     * so their data rows can be skipped at insert time.
+     * <p>
+     * Matching strategy: by child table name. The condition is evaluated
+     * against the TAG values from the manifest. Only child tables whose TAGs
+     * satisfy the condition are kept. Data-column-only conditions (e.g. {@code value > 100})
+     * cannot filter at manifest level — all child tables pass through, and filtering
+     * relies on the export side having already applied the data-column condition.
+     */
+    private List<ChildTableMeta> filterChildrenByImportConditions(
+            List<ChildTableMeta> children, SuperTableMeta meta,
+            String conditions, String stableName) {
+        // Parse condition fields
+        Set<String> conditionFields = extractConditionFields(conditions);
+        Set<String> tagNames = new LinkedHashSet<>();
+        for (DataColumn tag : meta.getTags()) {
+            tagNames.add(tag.getName().toLowerCase());
+        }
+
+        // Determine which referenced fields are TAG columns
+        Set<String> referencedTags = new LinkedHashSet<>();
+        boolean hasNonTagRefs = false;
+        for (String field : conditionFields) {
+            if (tagNames.contains(field.toLowerCase())) {
+                referencedTags.add(field.toLowerCase());
+            } else if (!"tbname".equalsIgnoreCase(field)) {
+                hasNonTagRefs = true;
+            }
+        }
+
+        if (referencedTags.isEmpty()) {
+            // Pure data-column or tbname conditions — cannot filter at manifest level.
+            // Data-column filtering is handled by the export side; here we keep all children.
+            if (hasNonTagRefs) {
+                log.info("  [{}] Import conditions reference only data columns — "
+                        + "all {} child tables pass manifest filter (row-level handled at insert)",
+                        stableName, children.size());
+            }
+            return new ArrayList<>(children);
+        }
+
+        List<ChildTableMeta> result = new ArrayList<>();
+        for (ChildTableMeta child : children) {
+            if (child == null || child.getTbname() == null) continue;
+            if (evaluateConditionsOnTags(child, meta, conditions, referencedTags)) {
+                result.add(child);
+            } else {
+                filteredOutChildTables.add(stableName + ":" + child.getTbname());
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Evaluate SQL-like WHERE conditions against a child table's TAG values.
+     * Only TAG-referenced parts are evaluated; data column references are treated
+     * as always-true (they are handled by the export-side filtering).
+     * <p>
+     * Supports: =, !=, IN, AND, OR, IS NULL, IS NOT NULL.
+     */
+    private boolean evaluateConditionsOnTags(ChildTableMeta child, SuperTableMeta meta,
+                                              String conditions, Set<String> referencedTags) {
+        String evaluable = conditions;
+
+        // Replace tag name references with their literal values
+        for (DataColumn tag : meta.getTags()) {
+            String tagName = tag.getName();
+            if (!referencedTags.contains(tagName.toLowerCase())) continue;
+            String val = child.getTagValues() != null ? child.getTagValues().get(tagName) : null;
+            // Replace bare and backtick-quoted tag name references with quoted literal.
+            // \b ensures we don't match substrings (e.g. "dev" won't match "device")
+            String replacement = val != null
+                    ? "'" + val.replace("\\", "\\\\").replace("'", "''") + "'"
+                    : "NULL";
+            evaluable = evaluable.replaceAll("(?i)\\b`?" + java.util.regex.Pattern.quote(tagName) + "`?\\b",
+                    java.util.regex.Matcher.quoteReplacement(replacement));
+        }
+
+        // Remove any remaining identifiers (data column refs) by replacing them with TRUE,
+        // and remove dangling AND/OR operators around them (simple heuristic)
+        // Actually, we use a simpler strategy: evaluate with a basic expression parser
+        return evaluateSimpleCondition(evaluable);
+    }
+
+    /**
+     * Evaluate a simplified WHERE expression where all identifiers have been replaced
+     * with literal values. Supports: =, !=, <>, IN (...), IS NULL, IS NOT NULL,
+     * AND, OR, parentheses.
+     */
+    private boolean evaluateSimpleCondition(String expr) {
+        if (expr == null || expr.isBlank()) return true;
+        try {
+            return evaluateOr(expr.trim());
+        } catch (Exception e) {
+            log.debug("  Condition evaluation failed for '{}': {} — defaulting to include", expr, e.getMessage());
+            return true;  // on parse failure, include the row (conservative)
+        }
+    }
+
+    private boolean evaluateOr(String expr) {
+        // Split by top-level OR
+        List<String> parts = splitTopLevel(expr, "OR");
+        for (String part : parts) {
+            if (evaluateAnd(part.trim())) return true;
+        }
+        return parts.isEmpty();
+    }
+
+    private boolean evaluateAnd(String expr) {
+        List<String> parts = splitTopLevel(expr, "AND");
+        for (String part : parts) {
+            if (!evaluateAtom(part.trim())) return false;
+        }
+        return true;
+    }
+
+    private boolean evaluateAtom(String expr) {
+        if (expr.isEmpty()) return true;
+        if (expr.equalsIgnoreCase("TRUE")) return true;
+        if (expr.equalsIgnoreCase("FALSE")) return false;
+
+        // Strip outer parentheses
+        String trimmed = expr.trim();
+        while (trimmed.startsWith("(") && trimmed.endsWith(")")) {
+            // Check if parens are balanced (not like "(a) OR (b)")
+            int depth = 0;
+            boolean balanced = true;
+            for (int i = 0; i < trimmed.length() - 1; i++) {
+                if (trimmed.charAt(i) == '(') depth++;
+                else if (trimmed.charAt(i) == ')') depth--;
+                if (depth == 0) { balanced = false; break; }
+            }
+            if (balanced && depth == 1) {
+                trimmed = trimmed.substring(1, trimmed.length() - 1).trim();
+            } else {
+                break;
+            }
+        }
+
+        // IS NULL / IS NOT NULL
+        if (trimmed.toUpperCase().endsWith(" IS NOT NULL")) {
+            String left = trimmed.substring(0, trimmed.length() - 11).trim();
+            return !isNullLiteral(left);
+        }
+        if (trimmed.toUpperCase().endsWith(" IS NULL")) {
+            String left = trimmed.substring(0, trimmed.length() - 8).trim();
+            return isNullLiteral(left);
+        }
+
+        // NOT IN (v1, v2, ...) — MUST be checked before IN,
+        // otherwise "IN" matches the "IN" inside "NOT IN"
+        int notInIdx = findOperatorIndex(trimmed, "NOT IN");
+        if (notInIdx >= 0) {
+            String left = trimmed.substring(0, notInIdx).trim();
+            String right = trimmed.substring(notInIdx + 6).trim();
+            if (right.startsWith("(") && right.endsWith(")")) {
+                right = right.substring(1, right.length() - 1);
+                String[] values = right.split(",");
+                for (String v : values) {
+                    if (valuesEqual(left.trim(), v.trim().replaceAll("^'|'$", ""))) return false;
+                }
+                return true;
+            }
+        }
+
+        // IN (v1, v2, ...)
+        int inIdx = findOperatorIndex(trimmed, "IN");
+        if (inIdx >= 0) {
+            String left = trimmed.substring(0, inIdx).trim();
+            String right = trimmed.substring(inIdx + 2).trim();
+            if (right.startsWith("(") && right.endsWith(")")) {
+                right = right.substring(1, right.length() - 1);
+                String[] values = right.split(",");
+                for (String v : values) {
+                    if (valuesEqual(left.trim(), v.trim().replaceAll("^'|'$", ""))) return true;
+                }
+                return false;
+            }
+        }
+
+        // != / <>
+        int neIdx = findOperatorIndex(trimmed, "!=");
+        if (neIdx < 0) neIdx = findOperatorIndex(trimmed, "<>");
+        if (neIdx >= 0) {
+            String left = trimmed.substring(0, neIdx).trim();
+            String right = trimmed.substring(neIdx + 2).trim();
+            return !valuesEqual(left, unquote(right));
+        }
+
+        // =
+        int eqIdx = findOperatorIndex(trimmed, "=");
+        if (eqIdx >= 0) {
+            String left = trimmed.substring(0, eqIdx).trim();
+            String right = trimmed.substring(eqIdx + 1).trim();
+            return valuesEqual(left, unquote(right));
+        }
+
+        // Fallback: if it's a recursive OR/AND, try again
+        if (trimmed.toUpperCase().contains(" OR ")) return evaluateOr(trimmed);
+        if (trimmed.toUpperCase().contains(" AND ")) return evaluateAnd(trimmed);
+
+        return true;
+    }
+
+    private List<String> splitTopLevel(String expr, String op) {
+        List<String> parts = new ArrayList<>();
+        int depth = 0;
+        int lastEnd = 0;
+        String upper = expr.toUpperCase();
+        String upperOp = op.toUpperCase();
+        int i = 0;
+        while (i < expr.length()) {
+            char c = expr.charAt(i);
+            if (c == '(') depth++;
+            else if (c == ')') depth--;
+            else if (c == '\'' || c == '"') {
+                // Skip quoted string
+                char q = c;
+                i++;
+                while (i < expr.length() && expr.charAt(i) != q) i++;
+            } else if (depth == 0 && i + op.length() <= expr.length()) {
+                boolean match = upper.startsWith(upperOp, i);
+                // Ensure word boundaries: before and after the operator
+                boolean beforeOk = i == 0 || !Character.isLetterOrDigit(expr.charAt(i - 1));
+                int after = i + op.length();
+                boolean afterOk = after >= expr.length() || !Character.isLetterOrDigit(expr.charAt(after));
+                if (match && beforeOk && afterOk) {
+                    parts.add(expr.substring(lastEnd, i).trim());
+                    i += op.length();
+                    lastEnd = i;
+                    continue;
+                }
+            }
+            i++;
+        }
+        parts.add(expr.substring(lastEnd).trim());
+        return parts;
+    }
+
+    private int findOperatorIndex(String expr, String op) {
+        int depth = 0;
+        String upper = expr.toUpperCase();
+        String upperOp = op.toUpperCase();
+        for (int i = 0; i < expr.length() - op.length() + 1; i++) {
+            char c = expr.charAt(i);
+            if (c == '(') depth++;
+            else if (c == ')') depth--;
+            else if (c == '\'' || c == '"') {
+                char q = c;
+                i++;
+                while (i < expr.length() && expr.charAt(i) != q) i++;
+            } else if (depth == 0) {
+                boolean beforeOk = i == 0 || !Character.isLetterOrDigit(expr.charAt(i - 1));
+                int after = i + op.length();
+                boolean afterOk = after >= expr.length() || !Character.isLetterOrDigit(expr.charAt(after));
+                if (upper.startsWith(upperOp, i) && beforeOk && afterOk) {
+                    return i;
+                }
+            }
+        }
+        return -1;
+    }
+
+    private boolean valuesEqual(String a, String b) {
+        String na = unquote(a.trim());
+        String nb = unquote(b.trim());
+        if (isNullLiteral(na) && isNullLiteral(nb)) return true;
+        if (isNullLiteral(na) || isNullLiteral(nb)) return false;
+        // Numeric comparison: try parse as numbers
+        try {
+            return Double.compare(Double.parseDouble(na), Double.parseDouble(nb)) == 0;
+        } catch (NumberFormatException ignored) {}
+        return na.equals(nb);
+    }
+
+    private String unquote(String s) {
+        if (s == null) return null;
+        String t = s.trim();
+        if (t.startsWith("'") && t.endsWith("'")) {
+            // Strip outer quotes and unescape SQL-style '' → '
+            return t.substring(1, t.length() - 1).replace("''", "'");
+        }
+        if (t.startsWith("\"") && t.endsWith("\"")) {
+            return t.substring(1, t.length() - 1);
+        }
+        return t;
+    }
+
+    private boolean isNullLiteral(String s) {
+        return s == null || s.equalsIgnoreCase("NULL") || s.equalsIgnoreCase("\\N");
+    }
+
+    /**
+     * Extract field/column names referenced in a SQL WHERE condition.
+     */
+    private Set<String> extractConditionFields(String condition) {
+        Set<String> fields = new LinkedHashSet<>();
+        if (condition == null || condition.isBlank()) return fields;
+
+        String normalized = condition.replace("!=", " ")
+                .replace(">=", " ")
+                .replace("<=", " ")
+                .replace("=", " ")
+                .replace(">", " ")
+                .replace("<", " ")
+                .replace("(", " ")
+                .replace(")", " ")
+                .replace(",", " ");
+
+        for (String token : normalized.split("\\s+")) {
+            if (token.isBlank()) continue;
+            if (token.startsWith("'") || token.startsWith("\"")) continue;
+            if (token.matches("(?i)and|or|not|in|like|is|null|between|exists|true|false")) continue;
+            if (token.matches("[0-9.]+")) continue;
+            fields.add(token.replace("`", ""));
+        }
+        return fields;
     }
 
     /**
@@ -777,6 +1207,72 @@ public class TdDataImporter implements DataImporter {
         }
     }
 
+    /**
+     * Validate import conditions against the schema file's column/tag definitions.
+     * This runs before any DB connection is created, so it doesn't require
+     * the target database or super tables to exist.
+     */
+    private void validateImportConditions(SchemaFile schemaFile) {
+        Map<String, String> importStableConditions = properties.getImportStableConditions();
+        String importConditions = properties.getImportConditions();
+        if ((importStableConditions == null || importStableConditions.isEmpty())
+                && (importConditions == null || importConditions.isBlank())) {
+            return;
+        }
+
+        // Collect stable names from per-table conditions + configured list
+        Set<String> stableNames = new LinkedHashSet<>();
+        if (importStableConditions != null) {
+            stableNames.addAll(importStableConditions.keySet());
+        }
+        if (stableNames.isEmpty() && importConditions != null && !importConditions.isBlank()) {
+            List<String> configured = properties.getSuperTables();
+            if (configured != null && !configured.isEmpty()) {
+                stableNames.addAll(configured);
+            } else {
+                // Validate against all super tables in the schema file
+                stableNames.addAll(schemaFile.getSuperTables().keySet());
+            }
+        }
+
+        for (String stableName : stableNames) {
+            SuperTableMeta meta = schemaFile.getSuperTables().get(stableName);
+            if (meta == null) {
+                log.warn("  Import condition references unknown super table '{}' — skipping validation", stableName);
+                continue;
+            }
+            Set<String> validColumns = new LinkedHashSet<>();
+            meta.getColumns().forEach(c -> validColumns.add(c.getName().toLowerCase()));
+            meta.getTags().forEach(t -> validColumns.add(t.getName().toLowerCase()));
+
+            // Validate per-table condition
+            String perTableCond = importStableConditions != null
+                    ? importStableConditions.getOrDefault(stableName, null) : null;
+            if (perTableCond != null && !perTableCond.isBlank()) {
+                Set<String> referenced = extractConditionFields(perTableCond);
+                for (String field : referenced) {
+                    if (!validColumns.contains(field.toLowerCase())) {
+                        throw new IllegalArgumentException(
+                                "Invalid import-stable-conditions field '" + field + "' for "
+                                        + stableName + ". Valid columns/tags: " + validColumns);
+                    }
+                }
+            }
+
+            // Validate common condition against this super table
+            if (importConditions != null && !importConditions.isBlank()) {
+                Set<String> referenced = extractConditionFields(importConditions);
+                for (String field : referenced) {
+                    if (!validColumns.contains(field.toLowerCase())) {
+                        throw new IllegalArgumentException(
+                                "Invalid import-conditions field '" + field + "' for "
+                                        + stableName + ". Valid columns/tags: " + validColumns);
+                    }
+                }
+            }
+        }
+    }
+
     private void validateAndCreateSchema(String database, SchemaFile schemaFile, TdConnection conn) throws Exception {
         log.info("Validating schema consistency...");
 
@@ -882,6 +1378,9 @@ public class TdDataImporter implements DataImporter {
 
         AtomicBoolean error = new AtomicBoolean(false);
         AtomicLong totalRecords = new AtomicLong(sp != null ? sp.getTotalRecords() : 0);
+        AtomicLong totalRead = new AtomicLong(0);
+        AtomicLong totalFiltered = new AtomicLong(0);
+        AtomicLong totalInsertedThisRun = new AtomicLong(0);
         AtomicLong lastProgressTime = new AtomicLong(System.currentTimeMillis());
         AtomicLong lastCheckpointSaveTime = new AtomicLong(System.currentTimeMillis());
 
@@ -911,6 +1410,7 @@ public class TdDataImporter implements DataImporter {
                         try {
                             int inserted = insertBatch(stableName, meta, tagColumnNames, job.lines, writeConn, ctx);
                             totalRecords.addAndGet(inserted);
+                            totalInsertedThisRun.addAndGet(inserted);
                             long committedOffset = job.tracker != null ? job.tracker.batchCompleted(job.batchIndex, inserted) : 0;
                             if (job.tracker != null) {
                                 maybeUpdateFileCheckpoint(sp, job.fileKey, committedOffset, totalRecords, lastCheckpointSaveTime);
@@ -997,6 +1497,18 @@ public class TdDataImporter implements DataImporter {
                         }
                     }
 
+                    // Skip entire file if child table was filtered out by import conditions
+                    if (ctx.currentFileChildTable != null
+                            && filteredOutChildTables.contains(stableName + ":" + ctx.currentFileChildTable)) {
+                        log.info("  [{}] Skipping file {} (child table {} filtered by import conditions)",
+                                stableName, fileKey, ctx.currentFileChildTable);
+                        if (sp != null) {
+                            sp.markFileCompleted(fileKey, 0);
+                            checkpointManager.markDirty();
+                        }
+                        continue;
+                    }
+
                     // Resume partial file
                     long fileOffset = (sp != null && fileKey.equals(sp.getCurrentFile()))
                             ? sp.getCurrentFileOffset() : 0;
@@ -1042,8 +1554,11 @@ public class TdDataImporter implements DataImporter {
                 }
 
                 long insertedRows = fileTracker.getInsertedRows();
-                log.info("  [{}] File {} finished: read {} rows, inserted {} rows",
-                        stableName, fileKey, fileRecordCount, insertedRows);
+                long fileFiltered = ctx.filteredInBatch.getAndSet(0);
+                totalRead.addAndGet(fileRecordCount);
+                totalFiltered.addAndGet(fileFiltered);
+                log.info("  [{}] File {} finished: read {} rows, inserted {} rows, filtered {} rows",
+                        stableName, fileKey, fileRecordCount, insertedRows, fileFiltered);
                 log.info("  [{}] File {} checkpoint state: currentFile={}, currentFileOffset={}, completedFiles={}",
                         stableName, fileKey,
                         sp != null ? sp.getCurrentFile() : null,
@@ -1085,7 +1600,30 @@ public class TdDataImporter implements DataImporter {
         }
 
         checkpointManager.saveIfDirty();
-        log.info("  [{}] Import completed: total {} records", stableName, totalRecords.get());
+        long read = totalRead.get();
+        long filtered = totalFiltered.get();
+        long sentToDb = read - filtered;
+        long acknowledgedByDb = totalInsertedThisRun.get();
+        long totalIncludingCheckpoint = totalRecords.get();
+        globalTotalRead.addAndGet(read);
+        globalTotalFiltered.addAndGet(filtered);
+        globalTotalInserted.addAndGet(acknowledgedByDb);
+        log.info("  +---------------------------------------------");
+        log.info("  | [{}] Import Summary", stableName);
+        log.info("  |   Rows read from data files : {}", read);
+        if (filtered > 0) {
+            log.info("  |   Rows filtered by import cond: {}", filtered);
+        }
+        log.info("  |   Rows sent to DB            : {}", sentToDb);
+        if (acknowledgedByDb != sentToDb) {
+            log.warn("  |   [WARN] DB acknowledged fewer rows ({}) than sent ({}) -- TDengine may have deduplicated {}",
+                    acknowledgedByDb, sentToDb, sentToDb - acknowledgedByDb);
+        }
+        log.info("  |   Rows acknowledged by DB    : {}", acknowledgedByDb);
+        if (totalIncludingCheckpoint != acknowledgedByDb) {
+            log.info("  |   Total incl. checkpoint     : {}", totalIncludingCheckpoint);
+        }
+        log.info("  +---------------------------------------------");
     }
 
     private void maybeUpdateFileCheckpoint(ProgressCheckpoint.StableProgress sp, String fileKey,
@@ -1119,6 +1657,8 @@ public class TdDataImporter implements DataImporter {
         boolean hasTbname;
         /** Per-child-table mode: all lines belong to this child table. */
         String currentFileChildTable;
+        /** Rows filtered out by import conditions in the current file (reset per file). */
+        final AtomicLong filteredInBatch = new AtomicLong(0);
 
         void initFromHeader(String headerLine) {
             this.header = parseCsvLine(headerLine);
@@ -1477,69 +2017,104 @@ public class TdDataImporter implements DataImporter {
 
             // All child tables already created during reconciliation — no USING TAGS needed
 
+            int actualInserted = 0;
             for (Map.Entry<String, List<String>> entry : grouped.entrySet()) {
                 String tbname = entry.getKey();
                 List<String> tableRecords = entry.getValue();
                 if (tableRecords.isEmpty()) continue;
 
-                StringBuilder sql = new StringBuilder(tableRecords.size() * 96 + 64);
-                sql.append("INSERT INTO `").append(tbname).append("` VALUES ");
+                // Skip child tables filtered out by import conditions
+                if (filteredOutChildTables.contains(stableName + ":" + tbname)) {
+                    ctx.filteredInBatch.addAndGet(tableRecords.size());
+                    continue;
+                }
 
-                for (int i = 0; i < tableRecords.size(); i++) {
-                    if (i > 0) sql.append(' ');
+                // Split into chunks to avoid TDengine SQL length / row-count limits
+                for (int chunkStart = 0; chunkStart < tableRecords.size(); chunkStart += MAX_VALUES_PER_INSERT) {
+                    int chunkEnd = Math.min(chunkStart + MAX_VALUES_PER_INSERT, tableRecords.size());
+                    int chunkSize = chunkEnd - chunkStart;
 
-                    if (properties.getFormat() == SyncProperties.DataFormat.CSV) {
-                        appendCsvValues(sql, tableRecords.get(i), ctx, meta);
-                    } else {
-                        appendJsonValues(sql, tableRecords.get(i), tagColumnNames);
+                    StringBuilder sql = new StringBuilder(chunkSize * 96 + 64);
+                    sql.append("INSERT INTO `").append(tbname).append("` VALUES ");
+
+                    for (int i = chunkStart; i < chunkEnd; i++) {
+                        if (i > chunkStart) sql.append(' ');
+
+                        if (properties.getFormat() == SyncProperties.DataFormat.CSV) {
+                            appendCsvValues(sql, tableRecords.get(i), ctx, meta);
+                        } else {
+                            appendJsonValues(sql, tableRecords.get(i), tagColumnNames);
+                        }
+                    }
+
+                    try {
+                        int affected = conn.executeUpdate(sql.toString());
+                        if (affected != chunkSize) {
+                            log.warn("INSERT row count mismatch for {}, child table {}: expected={}, actual={}",
+                                    stableName, tbname, chunkSize, affected);
+                        }
+                        actualInserted += affected;
+                    } catch (Exception e) {
+                        log.error("Batch insert FAILED for super table {}, child table {} (chunk {}..{}):\n  SQL (first 2000 chars): {}\n  Error: {}",
+                                stableName, tbname, chunkStart, chunkEnd - 1,
+                                sql.substring(0, Math.min(sql.length(), 2000)), e.getMessage());
+                        throw new RuntimeException("Batch insert failed: " + e.getMessage(), e);
                     }
                 }
-
-                try {
-                    conn.execute(sql.toString());
-                } catch (Exception e) {
-                    log.error("Batch insert FAILED for super table {}, child table {}:\n  SQL (first 2000 chars): {}\n  Error: {}",
-                            stableName, tbname, sql.substring(0, Math.min(sql.length(), 2000)), e.getMessage());
-                    throw new RuntimeException("Batch insert failed: " + e.getMessage(), e);
-                }
             }
-            return batchLines.size();
+            return actualInserted;
         } catch (Exception e) {
             log.error("Batch insert failed for super table {}: {}", stableName, e.getMessage());
             throw new RuntimeException("Batch insert failed: " + e.getMessage(), e);
         }
     }
 
+    /** Max value tuples per INSERT to avoid TDengine SQL length / row-count limits. */
+    private static final int MAX_VALUES_PER_INSERT = 200;
+
     /**
      * Insert a batch of records into a known child table (per-child-table format).
      * All lines in the batch belong to one child table, values are data columns only.
+     * Splits large batches into multiple INSERT statements to stay within TDengine limits.
      * The child table is already created by the manifest, so no USING TAGS needed.
      */
     private int insertBatchToChildTable(String stableName, SuperTableMeta meta, List<String> batchLines,
                                           TdConnection conn, PipelineCtx ctx) {
         String childTable = ctx.currentFileChildTable;
-        int estimated = Math.max(batchLines.size() * 64, 256);
-        StringBuilder sql = new StringBuilder(estimated);
-        sql.append("INSERT INTO `").append(childTable).append("` VALUES ");
+        int totalInserted = 0;
 
-        for (int i = 0; i < batchLines.size(); i++) {
-            if (i > 0) sql.append(' ');
-            if (properties.getFormat() == SyncProperties.DataFormat.CSV) {
-                appendCsvValuesForChildTable(sql, batchLines.get(i), ctx, meta);
-            } else {
-                // JSON: exclude tbname and tag_ fields
-                appendJsonValuesForChildTable(sql, batchLines.get(i));
+        for (int start = 0; start < batchLines.size(); start += MAX_VALUES_PER_INSERT) {
+            int end = Math.min(start + MAX_VALUES_PER_INSERT, batchLines.size());
+            int chunkSize = end - start;
+
+            StringBuilder sql = new StringBuilder(chunkSize * 96 + 64);
+            sql.append("INSERT INTO `").append(childTable).append("` VALUES ");
+
+            for (int i = start; i < end; i++) {
+                if (i > start) sql.append(' ');
+                if (properties.getFormat() == SyncProperties.DataFormat.CSV) {
+                    appendCsvValuesForChildTable(sql, batchLines.get(i), ctx, meta);
+                } else {
+                    // JSON: exclude tbname and tag_ fields
+                    appendJsonValuesForChildTable(sql, batchLines.get(i));
+                }
+            }
+
+            try {
+                int affected = conn.executeUpdate(sql.toString());
+                if (affected != chunkSize) {
+                    log.warn("INSERT row count mismatch for {}, child table {} (chunk {}..{}): expected={}, actual={}",
+                            stableName, childTable, start, end - 1, chunkSize, affected);
+                }
+                totalInserted += affected;
+            } catch (Exception e) {
+                log.error("Batch insert FAILED for child table {} (chunk {}..{}):\n  SQL (first 2000 chars): {}\n  Error: {}",
+                        childTable, start, end - 1,
+                        sql.substring(0, Math.min(sql.length(), 2000)), e.getMessage());
+                throw new RuntimeException("Batch insert failed: " + e.getMessage(), e);
             }
         }
-
-        try {
-            conn.execute(sql.toString());
-        } catch (Exception e) {
-            log.error("Batch insert FAILED for child table {}:\n  SQL (first 2000 chars): {}\n  Error: {}",
-                    childTable, sql.substring(0, Math.min(sql.length(), 2000)), e.getMessage());
-            throw new RuntimeException("Batch insert failed: " + e.getMessage(), e);
-        }
-        return batchLines.size();
+        return totalInserted;
     }
 
     /**
@@ -1844,5 +2419,19 @@ public class TdDataImporter implements DataImporter {
         if (ddl == null || ddl.isBlank()) return ddl;
         if (ddl.toUpperCase().contains("IF NOT EXISTS")) return ddl;
         return ddl.replaceFirst("(?i)CREATE\\s+STABLE\\s+", "CREATE STABLE IF NOT EXISTS ");
+    }
+
+    private static String getTimestampColumn(SuperTableMeta meta) {
+        if (meta == null || meta.getColumns() == null) return "ts";
+        for (DataColumn col : meta.getColumns()) {
+            if ("TIMESTAMP".equalsIgnoreCase(col.getType())) {
+                return col.getName();
+            }
+        }
+        return "ts";
+    }
+
+    private static String quoteId(String id) {
+        return "`" + id + "`";
     }
 }

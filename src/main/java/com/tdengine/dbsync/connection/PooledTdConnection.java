@@ -57,6 +57,12 @@ public class PooledTdConnection implements TdConnection {
     }
 
     @Override
+    public int executeUpdate(String sql) {
+        checkNotClosed();
+        return delegate.executeUpdate(sql);
+    }
+
+    @Override
     public ResultSet queryDirect(String sql) {
         checkNotClosed();
         return delegate.queryDirect(sql);

@@ -51,7 +51,7 @@ public class SyncService {
         log.info("  Format: {}", properties.getFormat());
         log.info("  File size: {} MB", properties.getFileSizeMb());
         log.info("  Batch size: {}", properties.getBatchSize());
-        log.info("  Page size: {}", properties.getPageSize());
+        log.info("  Export slice seconds: {}", properties.getExportSliceSeconds());
         log.info("  Parallel: {}", properties.getParallel());
         log.info("  Compression: {}", properties.getCompression());
         if (properties.hasTimeRange()) {

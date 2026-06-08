@@ -37,6 +37,13 @@ public interface TdConnection extends AutoCloseable {
     void execute(String sql);
 
     /**
+     * Execute an INSERT/UPDATE/DELETE and return the number of affected rows.
+     * TDengine may silently truncate large INSERTs; the caller MUST verify
+     * the returned count matches expectations.
+     */
+    int executeUpdate(String sql);
+
+    /**
      * Execute a query and return the result set directly.
      * Caller is responsible for closing resources.
      */

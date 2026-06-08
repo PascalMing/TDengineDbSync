@@ -46,6 +46,10 @@ public class SyncProperties {
     private boolean exportOrderByTs = false;
     /** Per-super-table additional export conditions, keyed by stable name */
     private Map<String, String> stableConditions = new HashMap<>();
+    /** Common non-time import conditions applied to all super tables */
+    private String importConditions = "";
+    /** Per-super-table additional import conditions, keyed by stable name */
+    private Map<String, String> importStableConditions = new HashMap<>();
     /** Export start time (inclusive). Format: "yyyy-MM-dd" or "yyyy-MM-dd HH:mm:ss". Blank=auto-detect. */
     private String startTime;
     /** Export end time (exclusive). Format: "yyyy-MM-dd" or "yyyy-MM-dd HH:mm:ss". Blank=auto-detect. */
@@ -66,10 +70,11 @@ public class SyncProperties {
     private int pipelineQueueSize = 10;
     /** Connection pool size (0 disables pooling, default 50) */
     private int connectionPoolSize = 50;
-    /** Page size for LIMIT/OFFSET pagination in export, default 5000. Larger = fewer HTTP requests but more memory per page. */
-    private int pageSize = 5000;
     /** Time window (minutes) per export partition, default 5. Smaller = more parallelism but more files. */
     private int partitionWindowMinutes = 5;
+    /** Export time-slice seconds: each SQL query covers exactly this many seconds.
+     *  Default 60 (1 minute). */
+    private int exportSliceSeconds = 60;
 
     public ConnectionMode getConnectionMode() {
         return connectionMode;
@@ -163,6 +168,22 @@ public class SyncProperties {
         this.stableConditions = stableConditions;
     }
 
+    public String getImportConditions() {
+        return importConditions;
+    }
+
+    public void setImportConditions(String importConditions) {
+        this.importConditions = importConditions;
+    }
+
+    public Map<String, String> getImportStableConditions() {
+        return importStableConditions;
+    }
+
+    public void setImportStableConditions(Map<String, String> importStableConditions) {
+        this.importStableConditions = importStableConditions;
+    }
+
     /**
      * Get the combined WHERE conditions for a specific super table.
      * Merges common conditions + per-table conditions with AND.
@@ -170,6 +191,24 @@ public class SyncProperties {
     public String getCombinedConditions(String stableName) {
         String common = (exportConditions != null && !exportConditions.isBlank()) ? exportConditions.trim() : "";
         String specific = stableConditions != null ? stableConditions.getOrDefault(stableName, "").trim() : "";
+
+        if (!common.isEmpty() && !specific.isEmpty()) {
+            return common + " AND " + specific;
+        } else if (!common.isEmpty()) {
+            return common;
+        } else if (!specific.isEmpty()) {
+            return specific;
+        }
+        return "";
+    }
+
+    /**
+     * Get the combined WHERE conditions for import of a specific super table.
+     * Merges common import conditions + per-table import conditions with AND.
+     */
+    public String getCombinedImportConditions(String stableName) {
+        String common = (importConditions != null && !importConditions.isBlank()) ? importConditions.trim() : "";
+        String specific = importStableConditions != null ? importStableConditions.getOrDefault(stableName, "").trim() : "";
 
         if (!common.isEmpty() && !specific.isEmpty()) {
             return common + " AND " + specific;
@@ -297,20 +336,20 @@ public class SyncProperties {
         this.connectionPoolSize = connectionPoolSize;
     }
 
-    public int getPageSize() {
-        return pageSize;
-    }
-
-    public void setPageSize(int pageSize) {
-        this.pageSize = pageSize;
-    }
-
     public int getPartitionWindowMinutes() {
         return partitionWindowMinutes;
     }
 
     public void setPartitionWindowMinutes(int partitionWindowMinutes) {
         this.partitionWindowMinutes = partitionWindowMinutes;
+    }
+
+    public int getExportSliceSeconds() {
+        return exportSliceSeconds;
+    }
+
+    public void setExportSliceSeconds(int exportSliceSeconds) {
+        this.exportSliceSeconds = exportSliceSeconds;
     }
 
     public static class JdbcConfig {

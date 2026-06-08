@@ -26,6 +26,7 @@ TDengine 3.0+ 数据库数据导出与导入工具，基于 Java 21 + Spring Boo
 - **CSV/JSON双格式**: CSV 格式高性能，JSON 格式兼容性好
 - **数据压缩**: Gzip 压缩，按文件大小（默认100MB）分文件
 - **组合查询条件**: 结构化时间范围(start-time/end-time) + 通用非时间条件 + 超级表级别附加条件
+- **导入侧条件过滤**: 支持独立于导出的导入条件（`import-conditions` / `import-stable-conditions`），仅创建和导入满足条件的子表及数据行，实现「导出全量、导入子集」
 - **分区目录组织**: 导出按 `{stableName}/{yyyyMMdd}/slice_{HHmmss}_{idx}/` 分目录存储，每个分区独立子目录
 - **LIMIT/OFFSET 分页**: 每页通过 SQL 级 LIMIT/OFFSET 拉取，避免 REST API 内存溢出（OOM）
 - **断点恢复**: 基于已完成文件的导入/导出恢复，支持中断后跳过已完成分区
@@ -144,6 +145,14 @@ tdengine:
     st1: "v1 > 100"
     st2: "status = 'active'"
 
+  # 通用导入过滤条件(应用于所有超级表, 仅导入满足条件的子表及数据)
+  import-conditions: ""
+
+  # 每个超级表的附加导入过滤条件(用AND与通用导入条件合并)
+  import-stable-conditions:
+    st1: "dev = 'dev0'"
+    st2: "loc IN ('bj', 'sh')"
+
   # 每个导出文件大小，单位 MB
   file-size-mb: 100
 
@@ -187,6 +196,8 @@ tdengine:
 | `export-conditions` | String | `""` | 通用非时间WHERE条件，应用于所有超级表 |
 | `export-order-by-ts` | boolean | `false` | 导出 SQL 是否按时间升序排序；默认关闭以提升吞吐 |
 | `stable-conditions` | Map | `{}` | 每个超级表的附加WHERE条件，与通用条件AND合并 |
+| `import-conditions` | String | `""` | 导入侧通用过滤条件，仅导入满足TAG条件的子表及数据行 |
+| `import-stable-conditions` | Map | `{}` | 导入侧每个超级表的附加过滤条件，与`import-conditions` AND 合并 |
 | `file-size-mb` | int | `100` | 每个导出文件大小，单位 MB |
 | `compression` | Enum | `gzip` | 压缩格式 |
 | `format` | Enum | `csv` | 数据格式，`csv`性能最优，`json`兼容性好 |
@@ -203,6 +214,11 @@ tdengine:
 说明: `export-order-by-ts=false` 是默认值，面向大规模导出时优先保证吞吐；如需严格时间有序输出，再显式开启。
 导出时间范围自动按 `partition-window-minutes` 划分为 N 分钟的时间窗口，每个窗口为一个独立分区并行导出，
 写入各自独立的 `slice_{HHmmss}_{idx}/` 子目录。文件切分按 `file-size-mb` 控制。
+
+导入侧条件过滤（`import-conditions` / `import-stable-conditions`）独立于导出条件运作：
+1. **子表层**: reconciliation 阶段读取 manifest 后按 TAG 条件过滤，不满足条件的子表不创建、不校验
+2. **数据行层**: `insertBatch` 通过 tbname 匹配跳过被过滤子表的数据行；per-child-table 文件整文件跳过并标记 checkpoint
+3. 纯数据列条件（如 `value > 100`）由导出侧处理，导入侧仅做子表名匹配
 
 ---
 
@@ -967,6 +983,41 @@ tdengine:
 每个分区生成的SQL类似（按时间窗口边界）：
 - temperature: `WHERE ts >=' {windowStart}' AND ts < '{windowEnd}' AND temperature > 0`
 - pressure: `WHERE ts >=' {windowStart}' AND ts < '{windowEnd}' AND pressure BETWEEN 900 AND 1100`
+
+### 示例3b: 导出全量、仅导入满足TAG条件的子表（导入侧条件过滤）
+
+导出时不加过滤条件，导出全部数据；导入时通过 `import-conditions` 仅导入 `dev = 'dev0'` 的子表及数据：
+
+```yaml
+# 导出配置（全量导出）
+tdengine:
+  mode: export
+  database: iot_db
+  start-time: "2024-06-01"
+  export-conditions: ""
+  stable-conditions: {}
+
+# 导入配置（仅导入 dev='dev0'）
+tdengine:
+  mode: import
+  database: iot_db
+  import-conditions: "dev = 'dev0'"
+  import-stable-conditions: {}
+```
+
+支持更复杂的导入过滤条件：
+
+```yaml
+# 按超级表指定不同导入条件
+import-stable-conditions:
+  temperature: "dev IN ('dev0', 'dev1') AND loc = 'bj'"
+  pressure: "sensor_type = 'digital'"
+```
+
+**工作原理**: 
+1. 导入 reconciliation 阶段读取子表 manifest 后，按 import conditions 评估每个子表的 TAG 值
+2. 不满足条件的子表被跳过（不创建、不校验）
+3. 数据导入时通过 tbname 匹配，仅写入已创建子表的数据行
 
 ### 示例4: 仅导出/导入指定的超级表
 

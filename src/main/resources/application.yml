@@ -1,69 +1,76 @@
 tdengine:
-  # Connection mode: jdbc / restful
+  # 连接模式: jdbc / restful
   connection-mode: restful
-  # JDBC configuration
+  # JDBC 配置
   jdbc:
     driver-class-name: com.taosdata.jdbc.TSDBDriver
     url: jdbc:TAOS://127.0.0.1:6030
     #url: jdbc:TAOS://192.168.3.145:6030
     username: root
     password: taosdata
-  # REST API configuration
+  # REST API 配置
   restful:
     url: http://127.0.0.1:6041
     #url: http://192.168.3.145:6041
     username: root
     password: taosdata
-    # REST/JDBC timeouts in milliseconds (default 300000 = 300s)
+    # REST/JDBC 超时时间（毫秒，默认 300000 = 300秒）
     connect-timeout: 300000
     socket-timeout: 300000
     request-timeout: 300000
-  # Run mode: export / import
-  mode: import
-  # Data directory for export/import files
+  # 运行模式: export / import
+  mode: export
+  # 导出/导入文件的数据目录
   data-dir: ./data
-  # Target database name
+  # 源数据库名称
   database: dbtest01
-  # Import target database (optional, defaults to same as database above when not set)
+  # 导入目标数据库（可选，未设置时默认与 database 相同）
   target-database: dbtest02
-  # Super tables list (empty means all super tables)
+  # 超级表列表（空列表表示所有超级表）
   super-tables: []
-  # Export start time (inclusive). Format: "yyyy-MM-dd" or "yyyy-MM-dd HH:mm:ss"
-  # Leave blank to auto-detect from database (MIN(ts) across all tables)
+   # 导出开始时间（含）。格式: "yyyy-MM-dd" 或 "yyyy-MM-dd HH:mm:ss"
+  # 留空则自动从数据库探测（取所有表 MIN(ts)）
   start-time: "2026-03-31 00:00:00"
-  # Export end time (exclusive). Format: "yyyy-MM-dd" or "yyyy-MM-dd HH:mm:ss"
-  # Leave blank to auto-detect from database (MAX(ts) across all tables)
+  # 导出结束时间（不含）。格式: "yyyy-MM-dd" 或 "yyyy-MM-dd HH:mm:ss"
+  # 留空则自动从数据库探测（取所有表 MAX(ts)）
   end-time: "2026-05-02 00:00:00"
-  # Common non-time export conditions applied to all super tables
+  # 应用于所有超级表的通用非时间导出条件
   export-conditions: ""
-  # Export SQL order by timestamp ascending (false = faster throughput, true = stable row order)
+  # 导出 SQL 是否按时间戳升序排序（false = 高吞吐，true = 稳定行序）
   export-order-by-ts: false
-  # Per-super-table additional non-time conditions (appended with AND to common conditions)
-  stable-conditions: {}
-    # stable_history_data: "thing_id = '023109006'"
-    # st1: "v1 > 100"
-    # st2: "status = 'active'"
-  # Export file rotation size in MB (default 100)
+  # 每个超级表的额外非时间条件（用 AND 追加到通用条件之后）。
+  # 格式为 Map: 键=超级表名, 值=条件。仅外部配置生效，内置 yml 不设默认值。
+  # 示例：
+  # stable-conditions:
+  #   stable_history_data: "thing_id = '023109006'"
+  #   st001: dev='dev0'
+  # 应用于所有超级表的通用非时间导入条件
+  import-conditions: ""
+  # 每个超级表的额外导入条件（用 AND 追加到通用导入条件之后）。
+  # 格式同上，仅外部配置生效。
+  # 示例：
+  # import-stable-conditions:
+  #   stable_history_data: "dev = 'dev0'"
+  #   st1: "loc IN ('bj', 'sh')"
+  # 导出文件轮转大小（MB，默认 100）
   file-size-mb: 100
-  # Records per compressed block file
+  # 每个压缩文件块记录数
   block-size: 100000
-  # Compression format: gzip
+  # 压缩格式: gzip
   compression: gzip
-  # Data file format: csv (fast) / json (compatible)
+  # 数据文件格式: csv（快速）/ json（兼容）
   format: csv
-  # Parallel threads for export/import (partition + per-day parallelism, multi-super-table + multi-writer import)
+  # 导出/导入并行线程数
   parallel: 50
-  # Batch insert size for import (larger = fewer HTTP round-trips)
-  batch-size: 5000
-  # Child table creation batch size for import (default 200)
+  # 导入批量插入大小（越大 HTTP 往返次数越少）
+  batch-size: 500
+  # 导入子表创建批量大小（默认 200）
   child-table-batch-size: 200
-  # Pipeline queue size (number of batches buffered between reader and writer)
+  # 导入管道队列大小（读取线程与写入线程之间缓冲的批次数）
   pipeline-queue-size: 50
-  # Connection pool size (0 disables pooling, default 50)
+  # 连接池大小（0 禁用连接池，默认 50）
   connection-pool-size: 60
-  # Page size for LIMIT/OFFSET pagination in export (default 5000).
-  # Larger = fewer HTTP requests but more memory per page.
-  page-size: 5000
-  # Time window (minutes) per export partition (default 5).
-  # Smaller = more parallelism but more files.
-  partition-window-minutes: 5
+  # 导出分区时间窗口（分钟，默认 15）。越小并发度越高，但文件数越多。
+  partition-window-minutes: 30
+  # 导出时间分片秒数：每条 SQL 查询覆盖的秒数。默认 60（1 分钟）。
+  export-slice-seconds: 60

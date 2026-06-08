@@ -19,7 +19,7 @@
 
     <properties>
         <java.version>21</java.version>
-        <taos-jdbc.version>3.5.3</taos-jdbc.version>
+        <taos-jdbc.version>3.8.3</taos-jdbc.version>
     </properties>
 
     <dependencies>

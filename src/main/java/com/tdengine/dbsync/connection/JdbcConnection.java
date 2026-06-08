@@ -124,6 +124,15 @@ public class JdbcConnection implements TdConnection {
     }
 
     @Override
+    public int executeUpdate(String sql) {
+        try (Statement stmt = getConnection().createStatement()) {
+            return stmt.executeUpdate(sql);
+        } catch (SQLException e) {
+            throw new RuntimeException("Execute update failed: " + sql + " - " + e.getMessage(), e);
+        }
+    }
+
+    @Override
     public void close() {
         if (connection != null) {
             try {

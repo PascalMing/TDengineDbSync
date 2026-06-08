@@ -32,7 +32,6 @@ import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicLong;
 
 public class TdDataExporter implements DataExporter {
 
@@ -66,6 +65,7 @@ public class TdDataExporter implements DataExporter {
         log.info("========== Start exporting database: {} ==========", database);
         log.info("  Format: {}, Parallel: {}, File size: {} MB",
                 properties.getFormat(), properties.getParallel(), properties.getFileSizeMb());
+        long startTime = System.currentTimeMillis();
 
         ProgressCheckpoint checkpoint = checkpointManager.getCheckpoint();
         if (checkpoint != null && !checkpoint.getStables().isEmpty()) {
@@ -112,7 +112,7 @@ public class TdDataExporter implements DataExporter {
                 checkpointManager.markDirty();
             }
 
-            exportChildTableStructureSet(database, stableNames, dataDir, metaConn, schemaFile, rangeStart, rangeEnd);
+            Map<String, Long> childTableCounts = exportChildTableStructureSet(database, stableNames, dataDir, metaConn, schemaFile, rangeStart, rangeEnd);
 
             // Build time-slice partitions covering the full time range
             int parallelism = Math.min(properties.getParallel(),
@@ -128,32 +128,33 @@ public class TdDataExporter implements DataExporter {
                         return t;
                     });
 
-            List<Future<Void>> futures = new ArrayList<>();
+            List<Future<Long>> futures = new ArrayList<>();
             for (Partition partition : partitions) {
                 futures.add(executor.submit(() -> {
                     try (TdConnection dataConn = connectionFactory.create()) {
                         log.info("  [{}][{}] Starting partition export",
                                 partition.stableName, partition.partitionDir.getFileName());
-                        exportPartitionData(database, partition,
+                        long records = exportPartitionData(database, partition,
                                 schemaFile.getSuperTables().get(partition.stableName),
                                 dataConn);
                         log.info("  [{}][{}] Partition completed",
                                 partition.stableName, partition.partitionDir.getFileName());
+                        return records;
                     } catch (Exception e) {
                         log.error("  [{}][{}] Partition FAILED: {}",
                                 partition.stableName, partition.partitionDir.getFileName(), e.getMessage(), e);
                         throw e;
                     }
-                    return null;
                 }));
             }
 
             executor.shutdown();
 
+            long totalRecords = 0;
             List<Exception> errors = new ArrayList<>();
-            for (Future<Void> future : futures) {
+            for (Future<Long> future : futures) {
                 try {
-                    future.get();
+                    totalRecords += future.get();
                 } catch (ExecutionException e) {
                     Throwable cause = e.getCause();
                     if (cause instanceof Exception ex) {
@@ -175,10 +176,17 @@ public class TdDataExporter implements DataExporter {
                 throw new RuntimeException(errors.size() + " partition(s) failed. First error: "
                         + errors.getFirst().getMessage());
             }
+
+            long elapsedMs = System.currentTimeMillis() - startTime;
+            long totalChildTables = childTableCounts.values().stream().mapToLong(Long::longValue).sum();
+            log.info("========== Export completed for database: {} ==========", database);
+            log.info("  Super tables : {}", stableNames.size());
+            log.info("  Child tables : {}", totalChildTables);
+            log.info("  Data records : {}", totalRecords);
+            log.info("  Total time   : {}", formatDuration(elapsedMs));
         }
 
         checkpointManager.delete();
-        log.info("========== Export completed for database: {} ==========", database);
     }
 
     // ---- Partition definition with time window ----
@@ -235,11 +243,16 @@ public class TdDataExporter implements DataExporter {
         return partitions;
     }
 
-    private void exportChildTableStructureSet(String database, List<String> stableNames, Path dataDir,
+    /**
+     * Export child table structure manifests.
+     * @return map of stableName → child table count
+     */
+    private Map<String, Long> exportChildTableStructureSet(String database, List<String> stableNames, Path dataDir,
                                               TdConnection conn, SchemaFile schemaFile,
                                               LocalDateTime rangeStart, LocalDateTime rangeEnd) throws Exception {
         Path structureDir = dataDir.resolve("structure");
         Files.createDirectories(structureDir);
+        Map<String, Long> childTableCounts = new LinkedHashMap<>();
 
         for (String stableName : stableNames) {
             SuperTableMeta meta = schemaFile.getSuperTables().get(stableName);
@@ -249,49 +262,70 @@ public class TdDataExporter implements DataExporter {
             }
 
             Path structurePath = structureDir.resolve(stableName + ".jsonl.gz");
+            long exportedCount = 0;
             try (OutputStream fos = Files.newOutputStream(structurePath);
                  GzipCompressorOutputStream gzipOut = new GzipCompressorOutputStream(new BufferedOutputStream(fos));
                  BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(gzipOut, StandardCharsets.UTF_8), 131072)) {
 
+                String conditions = properties.getCombinedConditions(stableName);
+
+                // Parse conditions into Java-side filter predicates.
+                // This avoids slow GROUP BY TBNAME queries that trigger HTTP gateway timeouts.
+                List<TagPredicate> tagPredicates = (conditions != null && !conditions.isBlank())
+                        ? parseConditionPredicates(conditions) : null;
+
+                // SHOW TABLE TAGS FROM is a fast metadata operation - fetch all at once.
+                // LIMIT/OFFSET is not supported on this statement in TDengine.
                 String sql = "SHOW TABLE TAGS FROM " + database + "." + stableName;
                 log.debug("  Querying child table tags for {}: {}", stableName, sql);
 
-                AtomicLong exportedCount = new AtomicLong();
-                conn.query(sql, rs -> {
+                ResultSet rs = conn.queryDirect(sql);
+                try {
                     ResultSetMetaData rsmd = rs.getMetaData();
                     int columnCount = rsmd.getColumnCount();
-
-                    // Column 1 is "tbname", remaining columns are tag names
                     List<String> tagColumnNames = new ArrayList<>();
                     for (int i = 2; i <= columnCount; i++) {
                         tagColumnNames.add(rsmd.getColumnLabel(i));
                     }
 
                     while (rs.next()) {
-                        ChildTableMeta ctm = new ChildTableMeta();
-                        ctm.setTbname(rs.getString(1));
+                        // Build tag value map for Java-side filtering
                         LinkedHashMap<String, String> tagVals = new LinkedHashMap<>();
                         for (int i = 0; i < tagColumnNames.size(); i++) {
                             Object val = rs.getObject(i + 2);
                             tagVals.put(tagColumnNames.get(i), val != null ? val.toString() : null);
                         }
+
+                        // Apply condition predicates in Java (fast, avoids data scan + GROUP BY)
+                        if (tagPredicates != null && !matchAllPredicates(tagPredicates, tagVals)) {
+                            continue;
+                        }
+
+                        ChildTableMeta ctm = new ChildTableMeta();
+                        ctm.setTbname(rs.getString(1));
                         ctm.setTagValues(tagVals);
                         writer.write(objectMapper.writeValueAsString(ctm));
                         writer.newLine();
-                        exportedCount.incrementAndGet();
+                        exportedCount++;
                     }
-                });
+                } finally {
+                    rs.close();
+                }
 
-                if (exportedCount.get() == 0) {
+                if (exportedCount == 0) {
                     log.warn("  No child tables found for {}, skipping structure set", stableName);
+                    childTableCounts.put(stableName, 0L);
                     continue;
                 }
+                childTableCounts.put(stableName, exportedCount);
             }
 
-            log.info("  Exported structure set for {} into {}", stableName, structurePath.getFileName());
+            log.info("  Exported structure set for {} ({} child tables) into {}",
+                    stableName, exportedCount, structurePath.getFileName());
         }
 
         log.info("Structure sets written to: {}", structureDir);
+        return childTableCounts;
     }
 
     private void cleanupLegacyExportFiles(Path dataDir, List<String> stableNames) throws IOException {
@@ -588,9 +622,9 @@ public class TdDataExporter implements DataExporter {
 
     // ---- Child table manifest export ----
 
-    // ---- Partition data export (single time-slice with LIMIT/OFFSET pagination) ----
+    // ---- Partition data export (time-slice pagination) ----
 
-    private void exportPartitionData(String database, Partition partition,
+    private long exportPartitionData(String database, Partition partition,
                                      SuperTableMeta meta, TdConnection conn) throws Exception {
         ProgressCheckpoint checkpoint = checkpointManager.getCheckpoint();
         ProgressCheckpoint.StableProgress sp = checkpoint != null
@@ -599,22 +633,24 @@ public class TdDataExporter implements DataExporter {
         String tsColumn = getTimestampColumnName(meta);
         String quotedTs = quoteId(tsColumn);
 
-        // Build SQL with partition's exact time window
-        String baseSql = "SELECT tbname, * FROM " + database + "." + partition.stableName
-                + " WHERE " + quotedTs + " >= '" + partition.windowStart.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
-                + "' AND " + quotedTs + " < '" + partition.windowEnd.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
-                + "'";
-
         // Non-time user conditions
         String userConditions = properties.getCombinedConditions(partition.stableName);
-        if (!userConditions.isEmpty()) {
-            baseSql += " AND " + userConditions;
+        DateTimeFormatter tsFmt = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+
+        int sliceSeconds = properties.getExportSliceSeconds();
+        if (sliceSeconds <= 0) {
+            sliceSeconds = 60;  // sensible default
         }
 
-        // Pagination settings
-        int pageSize = properties.getPageSize();
-        long offset = 0;
-        boolean hasMore = true;
+        // Build base SQL without time conditions (added per-slice below)
+        String baseSql = "SELECT tbname, * FROM " + database + "." + partition.stableName
+                + " WHERE 1=1";
+        if (!userConditions.isEmpty()) {
+            baseSql += " AND (" + userConditions + ")";
+        }
+
+        LocalDateTime sliceStart = partition.windowStart;
+
         boolean firstPage = true;
         int columnCount = 0;
         String[] colLabels = null;
@@ -636,11 +672,20 @@ public class TdDataExporter implements DataExporter {
 
         Path partDir = partition.partitionDir;
 
-        while (hasMore) {
-            String pageSql = baseSql + " LIMIT " + pageSize + " OFFSET " + offset;
-            log.debug("  [{}] Page offset={}: {}", partition.stableName, offset, pageSql);
+        // Time-slice loop: each query covers [sliceStart, sliceEnd)
+        while (sliceStart.isBefore(partition.windowEnd)) {
+            LocalDateTime sliceEnd = sliceStart.plusSeconds(sliceSeconds);
+            if (sliceEnd.isAfter(partition.windowEnd)) {
+                sliceEnd = partition.windowEnd;
+            }
+            String querySql = baseSql
+                    + " AND " + quotedTs + " >= '" + sliceStart.format(tsFmt) + "'"
+                    + " AND " + quotedTs + " < '" + sliceEnd.format(tsFmt) + "'";
+            log.debug("  [{}] Time slice [{}, {}): {}", partition.stableName,
+                    sliceStart.format(tsFmt), sliceEnd.format(tsFmt), querySql);
+            sliceStart = sliceEnd;
 
-            ResultSet rs = conn.queryDirect(pageSql);
+            ResultSet rs = conn.queryDirect(querySql);
 
             if (firstPage) {
                 ResultSetMetaData rsMeta = rs.getMetaData();
@@ -652,7 +697,6 @@ public class TdDataExporter implements DataExporter {
                 firstPage = false;
             }
 
-            int rowsInPage = 0;
             while (rs.next()) {
                 if (writer == null) {
                     Files.createDirectories(partDir);
@@ -697,14 +741,13 @@ public class TdDataExporter implements DataExporter {
                 Object tsVal = tsObj;
                 if (tsVal != null) {
                     lastTsValue = tsVal instanceof Timestamp t
-                            ? String.valueOf(t.getTime())
+                            ? String.valueOf(t.getTime() * 1_000_000L + t.getNanos() % 1_000_000)
                             : tsVal.toString();
                 }
 
                 totalRecords++;
                 currentFileRecords++;
                 currentFileBytes += writtenBytes;
-                rowsInPage++;
 
                 long now = System.currentTimeMillis();
                 if (now - lastProgressTime >= PROGRESS_LOG_INTERVAL_MS) {
@@ -739,8 +782,6 @@ public class TdDataExporter implements DataExporter {
             }
 
             rs.close();
-            offset += rowsInPage;
-            hasMore = rowsInPage >= pageSize;
         }
 
         if (writer != null) {
@@ -758,6 +799,7 @@ public class TdDataExporter implements DataExporter {
             log.info("  [{}][{}] Partition completed: {} records",
                     partition.stableName, partDir.getFileName(), totalRecords);
         }
+        return totalRecords;
     }
 
     private boolean isTagColumn(SuperTableMeta meta, String columnName) {
@@ -799,7 +841,7 @@ public class TdDataExporter implements DataExporter {
             if (value == null) {
                 sb.append(NULL_MARKER);
             } else if (value instanceof Timestamp ts) {
-                sb.append(ts.getTime());
+                sb.append(ts.toInstant().toString());
             } else if (value instanceof Number n) {
                 sb.append(n);
             } else {
@@ -855,7 +897,7 @@ public class TdDataExporter implements DataExporter {
             if (value == null) {
                 sb.append(NULL_MARKER);
             } else if (value instanceof Timestamp ts) {
-                sb.append(ts.getTime());
+                sb.append(ts.toInstant().toString());
             } else if (value instanceof Number n) {
                 sb.append(n);
             } else {
@@ -929,6 +971,115 @@ public class TdDataExporter implements DataExporter {
         }
         if (outputStream != null) {
             outputStream.close();
+        }
+    }
+
+    // ---- Condition predicate parsing for Java-side tag filtering ----
+
+    @FunctionalInterface
+    private interface TagPredicate {
+        boolean matches(Map<String, String> tagValues);
+    }
+
+    static List<TagPredicate> parseConditionPredicates(String condition) {
+        if (condition == null || condition.isBlank()) {
+            return Collections.emptyList();
+        }
+        List<TagPredicate> predicates = new ArrayList<>();
+        String[] parts = condition.split("(?i)\\s+AND\\s+");
+        for (String part : parts) {
+            part = part.trim();
+            if (part.isEmpty()) continue;
+            TagPredicate p = parseSinglePredicate(part);
+            if (p == null) {
+                log.warn("  Cannot parse condition fragment '{}', no filter applied", part);
+                return Collections.emptyList();
+            }
+            predicates.add(p);
+        }
+        return predicates;
+    }
+
+    private static TagPredicate parseSinglePredicate(String expr) {
+        java.util.regex.Matcher inMatcher = java.util.regex.Pattern.compile(
+                "^(\\w+)\\s+IN\\s*\\((.+)\\)$",
+                java.util.regex.Pattern.CASE_INSENSITIVE
+        ).matcher(expr.trim());
+        if (inMatcher.find()) {
+            String tagName = inMatcher.group(1).toLowerCase();
+            String valuesStr = inMatcher.group(2);
+            Set<String> acceptedValues = new HashSet<>();
+            java.util.regex.Matcher valMatcher = java.util.regex.Pattern.compile("'([^']*)'").matcher(valuesStr);
+            while (valMatcher.find()) {
+                acceptedValues.add(valMatcher.group(1));
+            }
+            if (!acceptedValues.isEmpty()) {
+                return tagValues -> {
+                    String v = getTagValueCI(tagValues, tagName);
+                    if (v == null) return false;
+                    return acceptedValues.contains(v);
+                };
+            }
+        }
+
+        java.util.regex.Matcher eqMatcher = java.util.regex.Pattern.compile(
+                "^(\\w+)\\s*=\\s*'([^']*)'$"
+        ).matcher(expr.trim());
+        if (eqMatcher.find()) {
+            String tagName = eqMatcher.group(1).toLowerCase();
+            String expectedValue = eqMatcher.group(2);
+            return tagValues -> {
+                String v = getTagValueCI(tagValues, tagName);
+                if (v == null) return false;
+                return expectedValue.equals(v);
+            };
+        }
+
+        java.util.regex.Matcher neqMatcher = java.util.regex.Pattern.compile(
+                "^(\\w+)\\s*!=\\s*'([^']*)'$"
+        ).matcher(expr.trim());
+        if (neqMatcher.find()) {
+            String tagName = neqMatcher.group(1).toLowerCase();
+            String excludedValue = neqMatcher.group(2);
+            return tagValues -> {
+                String v = getTagValueCI(tagValues, tagName);
+                if (v == null) return false;
+                return !excludedValue.equals(v);
+            };
+        }
+
+        return null;
+    }
+
+    static boolean matchAllPredicates(List<TagPredicate> predicates, Map<String, String> tagValues) {
+        if (predicates == null || predicates.isEmpty()) return true;
+        for (TagPredicate p : predicates) {
+            if (!p.matches(tagValues)) return false;
+        }
+        return true;
+    }
+
+    private static String getTagValueCI(Map<String, String> tagValues, String lowerKey) {
+        String v = tagValues.get(lowerKey);
+        if (v != null) return v;
+        for (Map.Entry<String, String> e : tagValues.entrySet()) {
+            if (e.getKey().equalsIgnoreCase(lowerKey)) return e.getValue();
+        }
+        return null;
+    }
+
+    /** Format milliseconds as HH:mm:ss for display. */
+    static String formatDuration(long millis) {
+        long seconds = millis / 1000;
+        long h = seconds / 3600;
+        long m = (seconds % 3600) / 60;
+        long s = seconds % 60;
+        if (h > 0) {
+            return String.format("%dh %02dm %02ds", h, m, s);
+        } else if (m > 0) {
+            return String.format("%dm %02ds", m, s);
+        } else {
+            return String.format("%ds", s);
         }
     }
 }
