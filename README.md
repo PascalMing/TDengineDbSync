@@ -28,7 +28,7 @@ TDengine 3.0+ 数据库数据导出与导入工具，基于 Java 21 + Spring Boo
 - **组合查询条件**: 结构化时间范围(start-time/end-time) + 通用非时间条件 + 超级表级别附加条件
 - **导入侧条件过滤**: 支持独立于导出的导入条件（`import-conditions` / `import-stable-conditions`），仅创建和导入满足条件的子表及数据行，实现「导出全量、导入子集」
 - **分区目录组织**: 导出按 `{stableName}/{yyyyMMdd}/slice_{HHmmss}_{idx}/` 分目录存储，每个分区独立子目录
-- **LIMIT/OFFSET 分页**: 每页通过 SQL 级 LIMIT/OFFSET 拉取，避免 REST API 内存溢出（OOM）
+- **时间切片分页**: 按可配置的时间切片（默认60秒）分页查询，避免分布式数据库 LIMIT/OFFSET 的页间重叠风险
 - **断点恢复**: 基于已完成文件的导入/导出恢复，支持中断后跳过已完成分区
 - **Schema一致性校验**: 导入时比对超级表DDL，不一致终止并提示
 - **高效导入**: 多消费者并行写入、生产者-消费者流水线、子表先创建后仅插入、多表合并INSERT、**多超级表并行导入**
@@ -174,11 +174,23 @@ tdengine:
   # 连接池大小(0禁用连接池)
   connection-pool-size: 50
 
-  # LIMIT/OFFSET 分页大小(导出)，越大单页数据越多但内存消耗越大
-  page-size: 5000
-
   # 时间窗口大小(分钟)，每个窗口为独立导出分区，越小并行度越高但文件越多
   partition-window-minutes: 5
+
+  # 时间切片秒数(导出)，每个SQL查询覆盖的秒数，越小查询粒度越细
+  export-slice-seconds: 60
+
+  # 导入批量写入大小
+  batch-size: 5000
+
+  # 子表创建批量大小
+  child-table-batch-size: 200
+
+  # 导入流水线队列深度(读取与写入之间的缓冲批次数)
+  pipeline-queue-size: 10
+
+  # 连接池大小(0禁用连接池)
+  connection-pool-size: 50
 ```
 
 ### 配置项说明
@@ -205,8 +217,8 @@ tdengine:
 | `batch-size` | int | `5000` | 导入批量INSERT大小。REST API模式下建议5000+以减少HTTP往返次数 |
 | `pipeline-queue-size` | int | `10` | 导入流水线队列深度 |
 | `connection-pool-size` | int | `50` | 连接池最大连接数，0禁用连接池 |
-| `page-size` | int | `5000` | LIMIT/OFFSET 分页大小，越大单页数据越多但内存消耗越大 |
 | `partition-window-minutes` | int | `5` | 时间窗口大小(分钟)，每个窗口为一个独立导出分区，越小并行度越高 |
+| `export-slice-seconds` | int | `60` | 时间切片秒数，每个SQL查询覆盖的秒级窗口，避免分布式分页重叠 |
 | `restful.connect-timeout` | int | `300000` | REST 连接建立超时，单位毫秒 |
 | `restful.socket-timeout` | int | `300000` | REST 读超时，单位毫秒 |
 | `restful.request-timeout` | int | `300000` | REST 请求等待超时，单位毫秒 |
@@ -234,7 +246,7 @@ TDengineDbSync/
 └── src/main/java/com/tdengine/dbsync/
     ├── DbSyncApplication.java              # SpringBoot 启动类
     ├── config/
-    │   └── SyncProperties.java             # 配置属性映射 (17个配置项, 4个枚举)
+    │   └── SyncProperties.java             # 配置属性映射 (19个配置项, 4个枚举)
     ├── connection/
     │   ├── TdConnection.java               # 连接抽象接口 (Strategy模式)
     │   ├── JdbcConnection.java             # JDBC原生连接实现
@@ -416,11 +428,9 @@ SyncRunner (CommandLineRunner)
 
          ┌────▼────┐ ┌───▼────┐ ┌───▼────┐      ┌────▼────┐
 
-         │LIMIT/   │ │LIMIT/  │ │LIMIT/  │      │LIMIT/   │
+         │时间切片    │ │时间切片  │ │时间切片  │      │时间切片   │
 
-         │OFFSET   │ │OFFSET  │ │OFFSET  │      │OFFSET   │
-
-         │分页拉取  │ │分页拉取 │ │分页拉取 │      │分页拉取  │
+         │ 分页查询   │ │分页查询 │ │分页查询 │      │分页查询  │
 
          └────┬────┘ └───┬────┘ └───┬────┘      └───┬─────┘
 
@@ -502,13 +512,14 @@ SyncRunner (CommandLineRunner)
            │
            │  INSERT SQL 构建:                                      │
            │  ┌──────────────────────────────────────────────┐      │
-           │  │ 子表不存在:                                     │      │
-           │  │   CREATE TABLE ... USING ... TAGS(...)         │      │
+           │  │ 子表已在 reconciliation 阶段预先创建，无需     │      │
+           │  │ USING TAGS 直接 INSERT                       │      │
+           │  │   INSERT INTO t1 VALUES (...), t2 VALUES     │      │
            │  │ 子表存在但 tag 不一致:                         │      │
-           │  │   ALTER TABLE ... SET TAG                      │      │
+           │  │   ALTER TABLE ... SET TAG                    │      │
            │  │ 子表已存在且 tag 一致:                         │      │
-           │  │   INSERT INTO t1 VALUES (...) t2 VALUES (...)  │      │
-           │  │   (多表合并, 一条SQL写入多个子表)               │      │
+           │  │   INSERT INTO t1 VALUES (...), t2 VALUES     │      │
+           │  │   (多表合并INSERT, 一条SQL写入多个子表)        │      │
            │  └──────────────────────────────────────────────┘      │
            └────────────────────────────────────────────────────────┘
 ```
@@ -664,7 +675,7 @@ JDBC 原生连接始终使用 `SHOW STABLES`，不受此问题影响。
 
 | # | 优化项 | 原方案 | 优化后 | 预估提升 |
 |---|--------|--------|--------|---------|
-| 1 | 时间窗口分区并行 | 串行遍历超级表 | 时间窗口切分 + LIMIT/OFFSET分页 | 30x+ (窗口数x线程数) |
+| 1 | 时间窗口+时间切片并行 | 串行遍历超级表 | 时间窗口切分 + 时间切片(60秒)分页 | 30x+ (窗口数x线程数) |
 | 2 | CSV格式替代JSON | 每行Jackson序列化 | StringBuilder直接拼接Tab分隔 | 5-10x (序列化) |
 | 3 | 时间戳断点恢复 | 重新查询+逐行跳过 | WHERE ts > lastExportTs | O(n)→O(1) |
 | 4 | 去除INDENT_OUTPUT | JSON美化缩进 | 数据文件无缩进 | 减少文件体积50%+ |
@@ -702,22 +713,21 @@ Thread-30: st30 ──── JDBC Connection 30 ───→ st30_*.gz
 
 ```
 1个超级表 st1, 100000个子表, parallel=30:
-每个分区独立查询 + LIMIT/OFFSET 分页拉取，达到 file-size-mb 后轮转文件。
-每个分区独立查询，结果通过 LIMIT/OFFSET 分页拉取（page-size 控制每页行数），
-避免 REST API 模式下 ResultSet 全量缓冲导致 OOM。
+每个分区独立查询，结果通过时间切片分页拉取（export-slice-seconds 控制每页秒数），
+避免 REST API 模式下 ResultSet 全量缓冲导致 OOM 以及分布式分页重叠。
 达到 file-size-mb 后自动轮转生成新的 .gz 文件。
 
 时间范围: 2024-01-01 00:00 ~ 00:30, partition-window-minutes=5
 
-Partition-0:  st1  00:00~00:05  ──── LIMIT/OFFSET 分页 ────→ slice_000000_00/st1_*.gz
-Partition-1:  st1  00:05~00:10  ──── LIMIT/OFFSET 分页 ────→ slice_000500_01/st1_*.gz
-Partition-2:  st1  00:10~00:15  ──── LIMIT/OFFSET 分页 ────→ slice_001000_02/st1_*.gz
+Partition-0:  st1  00:00~00:05  ──── 时间切片(60s)分页 ────→ slice_000000_00/st1_*.gz
+Partition-1:  st1  00:05~00:10  ──── 时间切片(60s)分页 ────→ slice_000500_01/st1_*.gz
+Partition-2:  st1  00:10~00:15  ──── 时间切片(60s)分页 ────→ slice_001000_02/st1_*.gz
   ...
-Partition-5:  st1  00:25~00:30  ──── LIMIT/OFFSET 分页 ────→ slice_002500_05/st1_*.gz
+Partition-5:  st1  00:25~00:30  ──── 时间切片(60s)分页 ────→ slice_002500_05/st1_*.gz
 
 每个分区使用独立连接, 提交到线程池并行执行
-每个分区的 SQL 使用 WHERE ts >= 'wStart' AND ts < 'wEnd' 精确限定时间窗口
-每个分区输出到独立 slice_* 子目录, 按 file-size-mb 轮转文件
+每个分区的 SQL 使用 WHERE ts >= 'wStart' AND ts < 'wEnd' 精确限定时间窗口，
+窗口内再按 export-slice-seconds 切分为时间切片（默认60秒），每个切片独立查询避免 OOM。
 所有分区完成后, 删除 checkpoint 文件
 ```
 
@@ -825,13 +835,9 @@ TdConnectionPool (Object Pool)
 ### 子表创建优化详解
 
 ```sql
--- 首次出现子表 t1: 创建并打标签
-INSERT INTO t1 USING st1 TAGS ('device1', 'beijing')
-  VALUES (1705334730000, 25.5, 60.2)
-        (1705334731000, 25.6, 60.1);
-
--- 后续写入子表 t1: 仅插入数据, 跳过USING TAGS
-INSERT INTO t1 VALUES (1705334732000, 25.7, 59.8);
+-- 子表已在 reconciliation 阶段预先创建（含TAG值），导入时直接INSERT
+INSERT INTO t1 VALUES (2026-05-05T16:00:00.162Z, 25.5, 60.2),
+                     (2026-05-05T16:00:01.123Z, 25.6, 60.1);
 
 -- 多表合并INSERT (同一batch中的不同子表)
 INSERT INTO t1 VALUES (...) (...) t2 VALUES (...) t3 VALUES (...);
@@ -902,11 +908,11 @@ Tab分隔，首行为列头，仅包含 tbname + 数据列（tag 列不写入数
 
 tbname	ts	temperature	humidity
 
-t1	1705334730000	25.5	60.2
+t1	2026-05-05T16:00:00.162Z	25.5	60.2
 
-t1	1705334731000	25.6	60.1
+t1	2026-05-05T16:00:01.123Z	25.6	60.1
 
-t2	1705334732000	22.1	55.3
+t2	2026-05-05T16:00:00.456Z	22.1	55.3
 
 ```
 
@@ -914,7 +920,7 @@ t2	1705334732000	22.1	55.3
 
 - `NULL` 值表示为 `\N`
 
-- Timestamp 以毫秒值存储
+- Timestamp 以 UTC ISO-8601 格式存储 (ts.toInstant().toString())，如 `2026-05-05T16:00:00.162Z`
 
 - 含 Tab/Newline 的字段用双引号包裹
 
@@ -980,9 +986,9 @@ tdengine:
     vibration: "amplitude > 0.5"
 ```
 
-每个分区生成的SQL类似（按时间窗口边界）：
-- temperature: `WHERE ts >=' {windowStart}' AND ts < '{windowEnd}' AND temperature > 0`
-- pressure: `WHERE ts >=' {windowStart}' AND ts < '{windowEnd}' AND pressure BETWEEN 900 AND 1100`
+每个分区的每个时间切片生成的SQL类似：
+- temperature: `SELECT tbname, * FROM iot_db.temperature WHERE ts >='2024-06-01 00:00:00' AND ts < '2024-06-01 00:01:00' AND temperature > 0`
+- pressure: `SELECT tbname, * FROM iot_db.pressure WHERE ts >='2024-06-01 00:00:00' AND ts < '2024-06-01 00:01:00' AND pressure BETWEEN 900 AND 1100`
 
 ### 示例3b: 导出全量、仅导入满足TAG条件的子表（导入侧条件过滤）
 
