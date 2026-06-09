@@ -75,6 +75,10 @@ public class SyncProperties {
     /** Export time-slice seconds: each SQL query covers exactly this many seconds.
      *  Default 60 (1 minute). */
     private int exportSliceSeconds = 60;
+    /** Timestamp offset in hours to correct timezone偏差 during import.
+     *  Positive value shifts timestamps forward, negative shifts backward.
+     *  Example: -8 corrects UTC+8 to UTC. Default 0 (no correction). */
+    private int timestampOffsetHours = 0;
 
     public ConnectionMode getConnectionMode() {
         return connectionMode;
@@ -350,6 +354,14 @@ public class SyncProperties {
 
     public void setExportSliceSeconds(int exportSliceSeconds) {
         this.exportSliceSeconds = exportSliceSeconds;
+    }
+
+    public int getTimestampOffsetHours() {
+        return timestampOffsetHours;
+    }
+
+    public void setTimestampOffsetHours(int timestampOffsetHours) {
+        this.timestampOffsetHours = timestampOffsetHours;
     }
 
     public static class JdbcConfig {

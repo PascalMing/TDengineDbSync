@@ -67,6 +67,22 @@ public class RestApiConnection implements TdConnection {
     }
 
     @Override
+    public String getServerVersion() {
+        try {
+            Connection conn = getConnection();
+            try (Statement stmt = conn.createStatement();
+                 ResultSet rs = stmt.executeQuery("SELECT SERVER_VERSION()")) {
+                if (rs.next()) {
+                    return rs.getString(1);
+                }
+            }
+        } catch (SQLException e) {
+            log.debug("Failed to get server version: {}", e.getMessage());
+        }
+        return "unknown";
+    }
+
+    @Override
     public List<String> getSuperTableNames(String database) {
         List<String> names = new ArrayList<>();
         try {

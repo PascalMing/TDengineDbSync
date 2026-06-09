@@ -174,6 +174,9 @@ public class TdDataImporter implements DataImporter {
         log.info("  Format: {}, Batch size: {}, Pipeline queue: {}, Writer threads: {}",
                 properties.getFormat(), properties.getBatchSize(),
                 properties.getPipelineQueueSize(), properties.getParallel());
+        if (properties.getTimestampOffsetHours() != 0) {
+            log.info("  Timestamp offset: {} hours", properties.getTimestampOffsetHours());
+        }
 
         ProgressCheckpoint checkpoint = checkpointManager.getCheckpoint();
         if (checkpoint != null && !checkpoint.getStables().isEmpty()) {
@@ -991,7 +994,9 @@ public class TdDataImporter implements DataImporter {
             // if the batch fails (e.g., connection-specific limitation).
             StringBuilder batchSql = new StringBuilder();
             for (ChildTableMeta child : needReset) {
-                batchSql.append(buildAlterChildTableTagSql(child, meta)).append(";");
+                for (String stmt : buildAlterChildTableTagSql(child, meta)) {
+                    batchSql.append(stmt).append(";");
+                }
             }
             try {
                 conn.execute(batchSql.toString());
@@ -999,7 +1004,9 @@ public class TdDataImporter implements DataImporter {
                 log.debug("  [{}] Batch ALTER TABLE failed, falling back to individual: {}",
                         stableName, batchEx.getMessage());
                 for (ChildTableMeta child : needReset) {
-                    conn.execute(buildAlterChildTableTagSql(child, meta));
+                    for (String stmt : buildAlterChildTableTagSql(child, meta)) {
+                        conn.execute(stmt);
+                    }
                 }
             }
             for (ChildTableMeta child : needReset) {
@@ -1182,11 +1189,16 @@ public class TdDataImporter implements DataImporter {
         }
     }
 
-    private String buildAlterChildTableTagSql(ChildTableMeta child, SuperTableMeta meta) {
-        StringBuilder sql = new StringBuilder();
-        sql.append("ALTER TABLE `").append(child.getTbname()).append("` SET TAG ");
-        appendNamedTagValues(sql, meta, child.getTagValues());
-        return sql.toString();
+    private List<String> buildAlterChildTableTagSql(ChildTableMeta child, SuperTableMeta meta) {
+        List<String> statements = new ArrayList<>();
+        // TDengine requires separate ALTER TABLE SET TAG for each tag
+        for (DataColumn tag : meta.getTags()) {
+            StringBuilder sql = new StringBuilder();
+            sql.append("ALTER TABLE `").append(child.getTbname()).append("` SET TAG ");
+            sql.append(tag.getName()).append('=').append(formatSqlValue(child.getTagValues().get(tag.getName())));
+            statements.add(sql.toString());
+        }
+        return statements;
     }
 
     private void appendTagValues(StringBuilder sql, SuperTableMeta meta, LinkedHashMap<String, String> tagValues) {
@@ -2138,6 +2150,14 @@ public class TdDataImporter implements DataImporter {
                 if (NULL_MARKER.equals(val)) {
                     sql.append("NULL");
                 } else {
+                    // Apply timestamp correction if this is a timestamp column
+                    int colIdx = i - startIdx;
+                    if (meta != null && meta.getColumns() != null && colIdx < meta.getColumns().size()) {
+                        DataColumn col = meta.getColumns().get(colIdx);
+                        if ("TIMESTAMP".equalsIgnoreCase(col.getType())) {
+                            val = correctTimestamp(val);
+                        }
+                    }
                     sql.append(formatSqlValue(val));
                 }
                 first = false;
@@ -2183,6 +2203,10 @@ public class TdDataImporter implements DataImporter {
             if ("null".equalsIgnoreCase(value) || value.isEmpty()) {
                 sql.append("NULL");
             } else {
+                // Apply timestamp correction if value looks like ISO-8601 timestamp
+                if (value.matches("\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}.*Z?")) {
+                    value = correctTimestamp(value);
+                }
                 sql.append(formatSqlValue(value));
             }
             first = false;
@@ -2248,6 +2272,14 @@ public class TdDataImporter implements DataImporter {
             if (NULL_MARKER.equals(val)) {
                 sql.append("NULL");
             } else {
+                // Apply timestamp correction if this is a timestamp column
+                int colIdx = i - startIdx;
+                if (meta != null && meta.getColumns() != null && colIdx < meta.getColumns().size()) {
+                    DataColumn col = meta.getColumns().get(colIdx);
+                    if ("TIMESTAMP".equalsIgnoreCase(col.getType())) {
+                        val = correctTimestamp(val);
+                    }
+                }
                 sql.append(formatSqlValue(val));
             }
             first = false;
@@ -2282,6 +2314,10 @@ public class TdDataImporter implements DataImporter {
             if ("null".equalsIgnoreCase(value) || value.isEmpty()) {
                 sql.append("NULL");
             } else {
+                // Apply timestamp correction if value looks like ISO-8601 timestamp
+                if (value.matches("\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}.*Z?")) {
+                    value = correctTimestamp(value);
+                }
                 sql.append(formatSqlValue(value));
             }
             first = false;
@@ -2311,6 +2347,34 @@ public class TdDataImporter implements DataImporter {
             while (end < json.length() && json.charAt(end) != ',' && json.charAt(end) != '}') end++;
             String val = json.substring(start, end).trim();
             return "null".equalsIgnoreCase(val) ? null : val;
+        }
+    }
+
+    /**
+     * Correct timestamp value by applying the configured offset.
+     * Parses ISO-8601 timestamp, applies hour offset, and returns corrected string.
+     * If parsing fails or offset is 0, returns original value.
+     */
+    private String correctTimestamp(String value) {
+        if (value == null || value.isEmpty() || properties.getTimestampOffsetHours() == 0) {
+            return value;
+        }
+        try {
+            // Parse ISO-8601 timestamp: 2026-05-05T16:00:00.162000001Z
+            // Remove trailing Z if present for parsing
+            String trimmed = value.endsWith("Z") ? value.substring(0, value.length() - 1) : value;
+            java.time.Instant instant = java.time.LocalDateTime.parse(trimmed,
+                    java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss[.SSSSSSSSS][.SSSSSS][.SSS]")
+            ).atZone(java.time.ZoneId.of("UTC")).toInstant();
+            // Apply offset
+            instant = instant.plus(java.time.Duration.ofHours(properties.getTimestampOffsetHours()));
+            // Format back to ISO-8601 with Z
+            return instant.atZone(java.time.ZoneId.of("UTC")).format(
+                    java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSSSSSSSS'Z'")
+            );
+        } catch (Exception e) {
+            // If parsing fails, return original value
+            return value;
         }
     }
 

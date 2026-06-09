@@ -67,6 +67,15 @@ public class SyncService {
             log.info("  Per-table conditions: {}", properties.getStableConditions());
         }
 
+        // Display server version (once at startup)
+        try (var conn = connectionFactory.create()) {
+            conn.testConnection();
+            String version = conn.getServerVersion();
+            log.info("  Server version: {}", version);
+        } catch (Exception e) {
+            log.warn("Failed to get server version: {}", e.getMessage());
+        }
+
         // Initialize checkpoint manager and register shutdown hook
         checkpointManager.init();
         checkpointManager.registerShutdownHook();

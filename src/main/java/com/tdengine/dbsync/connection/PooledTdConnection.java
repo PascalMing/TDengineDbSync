@@ -33,6 +33,12 @@ public class PooledTdConnection implements TdConnection {
     }
 
     @Override
+    public String getServerVersion() {
+        checkNotClosed();
+        return delegate.getServerVersion();
+    }
+
+    @Override
     public List<String> getSuperTableNames(String database) {
         checkNotClosed();
         return delegate.getSuperTableNames(database);

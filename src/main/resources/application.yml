@@ -74,3 +74,6 @@ tdengine:
   partition-window-minutes: 30
   # 导出时间分片秒数：每条 SQL 查询覆盖的秒数。默认 60（1 分钟）。
   export-slice-seconds: 60
+  # 导入时间戳修正小时数（默认 0，不修正）。
+  # 正值向前偏移，负值向后偏移。示例：-8 表示将 UTC+8 修正为 UTC。
+  timestamp-offset-hours: 0

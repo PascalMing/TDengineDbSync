@@ -17,6 +17,11 @@ public interface TdConnection extends AutoCloseable {
     void testConnection();
 
     /**
+     * Get the TDengine server version.
+     */
+    String getServerVersion();
+
+    /**
      * Get all super table names in the specified database.
      */
     List<String> getSuperTableNames(String database);
