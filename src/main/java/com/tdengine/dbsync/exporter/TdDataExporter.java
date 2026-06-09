@@ -841,7 +841,7 @@ public class TdDataExporter implements DataExporter {
             if (value == null) {
                 sb.append(NULL_MARKER);
             } else if (value instanceof Timestamp ts) {
-                sb.append(ts.toInstant().toString());
+                sb.append(formatTimestampWithNanos(ts));
             } else if (value instanceof Number n) {
                 sb.append(n);
             } else {
@@ -873,7 +873,7 @@ public class TdDataExporter implements DataExporter {
             }
             Object value = rs.getObject(i);
             if (value instanceof Timestamp ts) {
-                record.put(label, ts.toInstant().toString());
+                record.put(label, formatTimestampWithNanos(ts));
             } else {
                 record.put(label, value);
             }
@@ -897,7 +897,7 @@ public class TdDataExporter implements DataExporter {
             if (value == null) {
                 sb.append(NULL_MARKER);
             } else if (value instanceof Timestamp ts) {
-                sb.append(ts.toInstant().toString());
+                sb.append(formatTimestampWithNanos(ts));
             } else if (value instanceof Number n) {
                 sb.append(n);
             } else {
@@ -923,13 +923,36 @@ public class TdDataExporter implements DataExporter {
             String label = colLabels[i - 1];
             Object value = rs.getObject(i);
             if (value instanceof Timestamp ts) {
-                record.put(label, ts.toInstant().toString());
+                record.put(label, formatTimestampWithNanos(ts));
             } else {
                 record.put(label, value);
             }
         }
         writer.write(objectMapper.writeValueAsString(record));
         writer.newLine();
+    }
+
+    /**
+     * Format a Timestamp to ISO-8601 string with nanosecond precision.
+     * Unlike Instant.toString() which only keeps milliseconds, this preserves full nanosecond precision.
+     * Example: 2026-05-05T16:00:00.162000001Z
+     */
+    private String formatTimestampWithNanos(Timestamp ts) {
+        LocalDateTime ldt = ts.toLocalDateTime();
+        int nanos = ldt.getNano();
+        if (nanos == 0) {
+            // No fractional seconds
+            return ldt.format(DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss'Z'"));
+        } else if (nanos % 1_000_000 == 0) {
+            // Only milliseconds precision needed
+            return ldt.format(DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"));
+        } else if (nanos % 1_000 == 0) {
+            // Microseconds precision needed
+            return ldt.format(DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSSSSS'Z'"));
+        } else {
+            // Full nanoseconds precision
+            return ldt.format(DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSSSSSSSS'Z'"));
+        }
     }
 
     private String formatTimestampForFileName(Object tsValue) {
